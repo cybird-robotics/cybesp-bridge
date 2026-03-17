@@ -11,11 +11,14 @@ extern crate alloc;
 extern crate esp_backtrace as _;
 
 use alloc::string::ToString;
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, Ordering};
+use critical_section::Mutex;
 use embassy_executor::Spawner;
+use embassy_futures::select::{self, Either};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{Ipv4Address, Runner, Stack, StackResources};
-use embassy_time::Timer;
+use embassy_time::{Ticker, Timer};
 use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::uart::{UartRx, UartTx};
 use esp_hal_smartled::SmartLedsAdapter;
@@ -64,6 +67,77 @@ const STATUS_WIFI_CONNECTED: u8 = 2;
 const STATUS_WIFI_DISCONNECTED: u8 = 3;
 
 static BRIDGE_STATUS: AtomicU8 = AtomicU8::new(STATUS_BOOTING);
+
+// ---------------------------------------------------------------------------
+// NTP time state — shared between SNTP task and uplink task
+// ---------------------------------------------------------------------------
+
+/// NTP sync state: (ntp_time_us, capture_instant_us).
+/// `None` means not yet synced.
+static NTP_STATE: Mutex<RefCell<Option<(i64, i64)>>> = Mutex::new(RefCell::new(None));
+
+/// Store a new SNTP sync point.
+fn set_ntp_sync(ntp_us: i64, instant_us: i64) {
+    critical_section::with(|cs| {
+        NTP_STATE.borrow_ref_mut(cs).replace((ntp_us, instant_us));
+    });
+}
+
+/// Get current NTP time estimate by extrapolating from last SNTP sync.
+fn get_ntp_time_us() -> Option<i64> {
+    critical_section::with(|cs| {
+        let state = *NTP_STATE.borrow_ref(cs);
+        state.map(|(base, capture)| {
+            let now = embassy_time::Instant::now().as_micros() as i64;
+            base + (now - capture)
+        })
+    })
+}
+
+/// NTP epoch offset: seconds between 1900-01-01 and 1970-01-01.
+const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
+
+/// Minimal SNTP query: returns server UTC in microseconds since UNIX epoch.
+async fn sntp_query(stack: Stack<'static>) -> Option<i64> {
+    let mut rx_meta = [PacketMetadata::EMPTY; 1];
+    let mut tx_meta = [PacketMetadata::EMPTY; 1];
+    let mut rx_buf = [0u8; 64];
+    let mut tx_buf = [0u8; 64];
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    socket.bind(0).ok()?; // ephemeral port
+
+    // NTP request: LI=0, VN=4, Mode=3 (client)
+    let mut request = [0u8; 48];
+    request[0] = 0x23;
+    socket
+        .send_to(&request, (GROUND_STATION_IP, 123))
+        .await
+        .ok()?;
+
+    let mut resp = [0u8; 48];
+    let result = embassy_time::with_timeout(
+        embassy_time::Duration::from_secs(2),
+        socket.recv_from(&mut resp),
+    )
+    .await;
+
+    let (n, _) = match result {
+        Ok(Ok(r)) => r,
+        _ => return None,
+    };
+    if n < 48 {
+        return None;
+    }
+
+    // Transmit timestamp at offset 40: seconds (u32 BE) + fraction (u32 BE)
+    let secs = u32::from_be_bytes([resp[40], resp[41], resp[42], resp[43]]);
+    let frac = u32::from_be_bytes([resp[44], resp[45], resp[46], resp[47]]);
+
+    let unix_secs = secs as u64 - NTP_EPOCH_OFFSET;
+    let frac_us = (frac as u64 * 1_000_000) >> 32;
+
+    Some((unix_secs * 1_000_000 + frac_us) as i64)
+}
 
 // ---------------------------------------------------------------------------
 // COBS frame accumulator (ported from cybflight comm/mod.rs)
@@ -215,6 +289,37 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
 }
 
 // ---------------------------------------------------------------------------
+// SNTP sync task — periodically syncs to the GS PC NTP server
+// ---------------------------------------------------------------------------
+
+#[embassy_executor::task]
+async fn sntp_task(stack: Stack<'static>) {
+    // Wait for network.
+    loop {
+        if stack.is_link_up() {
+            break;
+        }
+        Timer::after_millis(100).await;
+    }
+    stack.wait_config_up().await;
+    info!("SNTP: network ready, starting sync");
+
+    loop {
+        match sntp_query(stack).await {
+            Some(ntp_us) => {
+                let now_us = embassy_time::Instant::now().as_micros() as i64;
+                set_ntp_sync(ntp_us, now_us);
+                info!("SNTP: synced (offset captured)");
+            }
+            None => {
+                warn!("SNTP: query failed");
+            }
+        }
+        Timer::after_secs(3).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Downlink: UART RX → COBS decode → UDP TX to ground station
 // ---------------------------------------------------------------------------
 
@@ -269,6 +374,24 @@ async fn downlink_task(mut uart_rx: UartRx<'static, esp_hal::Async>, stack: Stac
 // Uplink: UDP RX from ground station → COBS encode → UART TX
 // ---------------------------------------------------------------------------
 
+/// WireTimeSync msg_id (must match cybflight-msgs/src/wire.rs).
+const MSG_ID_TIME_SYNC: u8 = 129;
+
+/// Build a raw WireTimeSync frame: [msg_id, seq, esp_send_ntp_us, prev_tx_complete_ntp_us].
+fn build_time_sync_frame(
+    esp_send_ntp_us: i64,
+    prev_tx_complete_ntp_us: i64,
+    seq: &mut u8,
+) -> [u8; 18] {
+    let mut frame = [0u8; 18]; // 2 header + 16 payload
+    frame[0] = MSG_ID_TIME_SYNC;
+    frame[1] = *seq;
+    *seq = seq.wrapping_add(1);
+    frame[2..10].copy_from_slice(&esp_send_ntp_us.to_le_bytes());
+    frame[10..18].copy_from_slice(&prev_tx_complete_ntp_us.to_le_bytes());
+    frame
+}
+
 #[embassy_executor::task]
 async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<'static>) {
     // Wait for network to be ready.
@@ -292,11 +415,21 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
 
     let mut recv_buf = [0u8; MAX_RAW_FRAME];
     let mut cobs_buf = [0u8; MAX_COBS_BUF];
+    let mut seq: u8 = 0;
+
+    // PTP follow-up state: NTP time at TX-complete of the previous time sync frame.
+    let mut prev_tx_complete_ntp_us: i64 = 0;
+    let mut time_sync_ticker = Ticker::every(embassy_time::Duration::from_secs(3));
 
     loop {
-        match socket.recv_from(&mut recv_buf).await {
-            Ok((n, _remote)) => {
-                // COBS-encode the raw datagram and append 0x00 delimiter.
+        match select::select(
+            socket.recv_from(&mut recv_buf),
+            time_sync_ticker.next(),
+        )
+        .await
+        {
+            Either::First(Ok((n, _remote))) => {
+                // Normal uplink: COBS-encode the raw datagram and forward to UART.
                 let encoded_len = cobs::encode(&recv_buf[..n], &mut cobs_buf);
                 cobs_buf[encoded_len] = 0x00;
                 let total = encoded_len + 1;
@@ -307,9 +440,32 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
                     warn!("Uplink: UART write error: {:?}", e);
                 }
             }
-            Err(e) => {
+            Either::First(Err(e)) => {
                 warn!("Uplink: UDP recv error: {:?}", e);
                 Timer::after_millis(10).await;
+            }
+            Either::Second(_) => {
+                // Time sync tick: send PTP follow-up frame to STM32.
+                if let Some(send_ntp_us) = get_ntp_time_us() {
+                    let frame =
+                        build_time_sync_frame(send_ntp_us, prev_tx_complete_ntp_us, &mut seq);
+                    let encoded_len = cobs::encode(&frame, &mut cobs_buf);
+                    cobs_buf[encoded_len] = 0x00;
+                    let total = encoded_len + 1;
+
+                    if let Err(e) =
+                        embedded_io_async::Write::write_all(&mut uart_tx, &cobs_buf[..total]).await
+                    {
+                        warn!("Uplink: time sync UART write error: {:?}", e);
+                    }
+
+                    // Capture NTP time after write_all() returns for PTP follow-up.
+                    // Note: write_all() returns at DMA-complete (data in UART FIFO),
+                    // not shift-register-empty, so this timestamp may be up to one
+                    // frame-duration (~217 µs at 921.6k baud) early.  The resulting
+                    // constant bias is absorbed by the STM32's EMA smoother.
+                    prev_tx_complete_ntp_us = get_ntp_time_us().unwrap_or(0);
+                }
             }
         }
     }
@@ -374,7 +530,7 @@ async fn main(spawner: Spawner) -> ! {
         (rng.random() as u64) | ((rng.random() as u64) << 32)
     };
 
-    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         sta_interface,
         embassy_net::Config::dhcpv4(Default::default()),
@@ -387,6 +543,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(net_task(runner)).unwrap();
     spawner.spawn(downlink_task(uart_rx, stack)).unwrap();
     spawner.spawn(uplink_task(uart_tx, stack)).unwrap();
+    spawner.spawn(sntp_task(stack)).unwrap();
 
     info!("cybesp-bridge: all tasks spawned");
 
