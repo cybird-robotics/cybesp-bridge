@@ -235,7 +235,8 @@ async fn downlink_task(mut uart_rx: UartRx<'static, esp_hal::Async>, stack: Stac
     let mut tx_meta = [PacketMetadata::EMPTY; 2];
     let mut rx_buf = [0u8; 128];
     let mut tx_buf = [0u8; 128];
-    let socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    socket.bind(0).unwrap(); // ephemeral local port
 
     let remote = (GROUND_STATION_IP, DOWNLINK_PORT);
 
