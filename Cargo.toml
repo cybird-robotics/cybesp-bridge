@@ -1,0 +1,92 @@
+[package]
+name = "cybesp-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = ["utadr"]
+
+[[bin]]
+name = "cybesp-bridge"
+path = "./src/bin/main.rs"
+
+[dependencies]
+# ESP32-C6 HAL
+esp-hal = { version = "~1.0", features = ["esp32c6", "unstable", "log-04"] }
+
+# Embassy async runtime for ESP
+esp-rtos = { version = "0.2.0", features = [
+    "esp32c6",
+    "embassy",
+    "esp-radio",
+    "esp-alloc",
+    "log-04",
+] }
+
+# Bootloader app descriptor
+esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c6"] }
+
+# WiFi driver
+esp-radio = { version = "0.17.0", features = [
+    "esp32c6",
+    "wifi",
+    "smoltcp",
+    "esp-alloc",
+    "unstable",
+    "log-04",
+] }
+
+# Embassy async
+embassy-executor = { version = "0.9.1" }
+embassy-time = { version = "0.5.0" }
+
+# Networking
+embassy-net = { version = "0.7.1", features = [
+    "udp",
+    "dhcpv4",
+    "medium-ethernet",
+    "log",
+] }
+
+smoltcp = { version = "0.12.0", default-features = false, features = [
+    "medium-ethernet",
+    "proto-dhcpv4",
+    "proto-ipv4",
+    "socket-udp",
+    "log",
+] }
+
+# Heap allocator (required by WiFi)
+esp-alloc = { version = "0.9.0" }
+
+# Logging (log crate via USB serial)
+log = "0.4"
+esp-println = { version = "0.16.1", features = ["log-04", "esp32c6"] }
+esp-backtrace = { version = "0.18.1", features = ["esp32c6", "panic-handler", "println"] }
+
+# I/O traits
+embedded-io = "0.7"
+embedded-io-async = "0.7"
+
+# Addressable LED (WS2812 on GPIO8)
+esp-hal-smartled = "0.17.0"
+smart-leds = "0.4.0"
+rgb = { version = "0.8", default-features = false }
+
+# COBS framing (same version as cybflight STM32 firmware)
+cobs = { version = "0.5", default-features = false }
+
+# Static allocation
+static_cell = "2.1.1"
+critical-section = "1.2.0"
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false

@@ -1,0 +1,73 @@
+name: Rust CI & Publish
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv32imac-unknown-none-elf
+          components: rust-src, clippy
+
+      - name: Cargo Cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key:
+            ${{ runner.os }}-cargo-esp32c6-${{
+            hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run:
+          cargo build --target riscv32imac-unknown-none-elf -Z build-std=alloc,core
+
+  publish:
+    name: Publish Crate
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: WireGuard
+        uses: egor-tensin/setup-wireguard@v1
+        with:
+          endpoint: ${{ secrets.WG_ENDPOINT }}
+          endpoint_public_key: ${{ secrets.WG_SERVER_PUBLIC_KEY }}
+          ips: "10.0.0.7/32"
+          allowed_ips: "10.0.0.0/24, 192.168.8.0/24"
+          private_key: ${{ secrets.WG_CI_PRIVATE_KEY }}
+
+      - name: Set DNS
+        run:
+          echo "192.168.8.114 crates.yifanl.com pypi.yifanl.com" | sudo tee -a
+          /etc/hosts
+
+      - name: Publish to Kellnr
+        env:
+          CARGO_REGISTRIES_UTADR_TOKEN: ${{ secrets.KELLNR_TOKEN }}
+        run: cargo publish --registry utadr
