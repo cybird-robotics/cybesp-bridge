@@ -51,8 +51,8 @@ const UPLINK_PORT: u16 = 4211;
 // COBS framing constants (matches cybflight wire format)
 // ---------------------------------------------------------------------------
 
-/// Max raw (decoded) frame: [msg_id: u8][seq: u8][payload up to 64 bytes].
-const MAX_RAW_FRAME: usize = 2 + 64;
+/// Max raw (decoded) frame: [msg_id: u8][seq: u8][payload up to 128 bytes].
+const MAX_RAW_FRAME: usize = 2 + 128;
 /// Max COBS-encoded frame including 0x00 delimiter.
 const MAX_COBS_BUF: usize = cobs::max_encoding_length(MAX_RAW_FRAME) + 1;
 
@@ -338,8 +338,8 @@ async fn downlink_task(mut uart_rx: UartRx<'static, esp_hal::Async>, stack: Stac
 
     let mut rx_meta = [PacketMetadata::EMPTY; 2];
     let mut tx_meta = [PacketMetadata::EMPTY; 2];
-    let mut rx_buf = [0u8; 128];
-    let mut tx_buf = [0u8; 128];
+    let mut rx_buf = [0u8; 256];
+    let mut tx_buf = [0u8; 256];
     let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
     socket.bind(0).unwrap(); // ephemeral local port
 
