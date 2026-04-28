@@ -593,7 +593,8 @@ async fn main(spawner: Spawner) -> ! {
         (rng.random() as u64) | ((rng.random() as u64) << 32)
     };
 
-    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+    // 4 user sockets (downlink, uplink, rtcm_uplink, sntp) + DHCP + DNS.
+    static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         sta_interface,
         embassy_net::Config::dhcpv4(Default::default()),
