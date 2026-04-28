@@ -46,6 +46,10 @@ const GROUND_STATION_IP: Ipv4Address = Ipv4Address::new(192, 168, 50, 101);
 const DOWNLINK_PORT: u16 = 4210;
 /// UDP port this bridge listens on for uplink commands.
 const UPLINK_PORT: u16 = 4211;
+/// UDP port this bridge listens on for RTCM3 corrections destined for
+/// the ublox GPS UART2. Datagrams are written verbatim to UART1 — no
+/// COBS, no framing. The ublox parses RTCM3 itself (length + CRC24Q).
+const RTCM_UPLINK_PORT: u16 = 4212;
 
 // ---------------------------------------------------------------------------
 // COBS framing constants (matches cybflight wire format)
@@ -472,6 +476,54 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
 }
 
 // ---------------------------------------------------------------------------
+// RTCM uplink: UDP RX from ground station → raw UART1 TX → ublox UART2
+// ---------------------------------------------------------------------------
+//
+// RTK corrections from cybgcs's NTRIP client land here. We forward bytes
+// verbatim to UART1 — no COBS, no parsing. The ublox receiver parses RTCM3
+// itself (each frame has a length header + CRC24Q), so partial loss only
+// affects single corrections. cybgcs sends one RTCM3 frame per datagram.
+
+#[embassy_executor::task]
+async fn rtcm_uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<'static>) {
+    loop {
+        if stack.is_link_up() {
+            break;
+        }
+        Timer::after_millis(100).await;
+    }
+    info!("RTCM uplink: network link up, waiting for IP...");
+    stack.wait_config_up().await;
+    info!("RTCM uplink: IP acquired, starting");
+
+    let mut rx_meta = [PacketMetadata::EMPTY; 4];
+    let mut tx_meta = [PacketMetadata::EMPTY; 1];
+    // RTCM3 frames are at most 1029 bytes; allow a few in flight.
+    let mut rx_buf = [0u8; 4096];
+    let mut tx_buf = [0u8; 1];
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    socket.bind(RTCM_UPLINK_PORT).unwrap();
+    info!("RTCM uplink: listening on UDP :{}", RTCM_UPLINK_PORT);
+
+    let mut recv_buf = [0u8; 1500];
+    loop {
+        match socket.recv_from(&mut recv_buf).await {
+            Ok((n, _)) => {
+                if let Err(e) =
+                    embedded_io_async::Write::write_all(&mut uart_tx, &recv_buf[..n]).await
+                {
+                    warn!("RTCM uplink: UART1 write error: {:?}", e);
+                }
+            }
+            Err(e) => {
+                warn!("RTCM uplink: UDP recv error: {:?}", e);
+                Timer::after_millis(10).await;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -513,6 +565,17 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("cybesp-bridge: UART0 init OK (921600 baud)");
 
+    // 6a. Init UART1 for RTCM3 forwarding to ublox UART2 (115200 baud, TX-only on GPIO14).
+    // The ublox doesn't talk back on UART2, so we don't bind an RX pin.
+    let rtcm_uart_config = esp_hal::uart::Config::default().with_baudrate(115_200);
+    let rtcm_uart = esp_hal::uart::Uart::new(peripherals.UART1, rtcm_uart_config)
+        .unwrap()
+        .with_tx(peripherals.GPIO14)
+        .into_async();
+    let (_, rtcm_uart_tx) = rtcm_uart.split();
+
+    info!("cybesp-bridge: UART1 init OK (115200 baud, RTCM3 → ublox UART2)");
+
     // 7. Init WiFi radio.
     let radio_init = &*mk_static!(
         esp_radio::Controller<'static>,
@@ -543,6 +606,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(net_task(runner)).unwrap();
     spawner.spawn(downlink_task(uart_rx, stack)).unwrap();
     spawner.spawn(uplink_task(uart_tx, stack)).unwrap();
+    spawner.spawn(rtcm_uplink_task(rtcm_uart_tx, stack)).unwrap();
     spawner.spawn(sntp_task(stack)).unwrap();
 
     info!("cybesp-bridge: all tasks spawned");
