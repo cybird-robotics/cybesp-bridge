@@ -26,24 +26,41 @@ UDP TX :4211  ────► UDP datagram ───► COBS encode ──► UA
 
 ## Hardware
 
-| Pin | Function | Connects to |
-|-----|----------|-------------|
-| GPIO16 | UART0 TX | STM32 USART6 RX (PC7) |
-| GPIO17 | UART0 RX | STM32 USART6 TX (PC6) |
-| GND | Ground | STM32 GND |
+Two boards are supported, selected at build time via a Cargo feature
+(`board-waveshare`, the default, or `board-xiao-c6`). Both use the ESP32-C6
+MCU and native USB for programming/logging. Only the RTCM pin, status LED, and
+antenna handling differ.
 
-UART configuration: 921600 baud, 8N1, no flow control.
+| Function | Connects to | Waveshare ESP32-C6-Zero | Seeed XIAO ESP32-C6 |
+|----------|-------------|-------------------------|---------------------|
+| UART0 TX | STM32 USART6 RX (PC7) | GPIO16 | GPIO16 (D6) |
+| UART0 RX | STM32 USART6 TX (PC6) | GPIO17 | GPIO17 (D7) |
+| UART1 TX | ublox UART2 (RTCM3 in) | GPIO14 | GPIO0 (D0) |
+| Status LED | onboard | WS2812 RGB on GPIO8 | mono LED on GPIO15 |
+| Antenna | onboard | fixed | GPIO3=LOW + GPIO14=LOW (built-in PCB) |
+| GND | STM32 GND | GND | GND |
 
-The ESP32-C6-Zero uses native USB for programming and log output, so UART0
-pins are free for external communication.
+UART0 configuration: 921600 baud, 8N1, no flow control. UART1: 115200 baud,
+TX-only. On the XIAO, GPIO14 is the antenna switch, so the RTCM3 TX moves to
+GPIO0.
 
-## LED Status (WS2812 on GPIO8)
+## LED Status
+
+**Waveshare (WS2812 RGB on GPIO8):**
 
 | Pattern | Meaning |
 |---------|---------|
 | Breathing blue | Booting / connecting to WiFi |
 | Solid dim green | WiFi connected, bridge running |
 | Blinking red | WiFi disconnected |
+
+**XIAO (single mono LED on GPIO15 — status by blink rate):**
+
+| Pattern | Meaning |
+|---------|---------|
+| Slow blink (~1 Hz) | Booting / connecting to WiFi |
+| Solid on | WiFi connected, bridge running |
+| Fast blink (~5 Hz) | WiFi disconnected |
 
 ## Configuration
 
@@ -65,11 +82,13 @@ Prerequisites:
 - `espflash` CLI: `cargo install espflash`
 
 ```sh
-# Build
+# --- Waveshare ESP32-C6-Zero (default) ---
 cargo build --release
+cargo run --release                 # build + flash + monitor
 
-# Build + flash + monitor (USB cable to ESP32-C6-Zero)
-cargo run --release
+# --- Seeed XIAO ESP32-C6 ---
+cargo build --release --no-default-features --features board-xiao-c6
+cargo run   --release --no-default-features --features board-xiao-c6
 ```
 
 Log output appears in the monitor via USB serial. Set verbosity via the

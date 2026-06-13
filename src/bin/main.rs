@@ -1,11 +1,18 @@
 //! cybesp-bridge — Message-agnostic WiFi↔UART bridge for cybflight.
 //!
-//! Runs on Waveshare ESP32-C6-Zero. Forwards COBS-framed UART data from
-//! an STM32H743 flight controller to raw UDP datagrams over WiFi, and
-//! vice versa. Does not interpret message contents.
+//! Runs on either the Waveshare ESP32-C6-Zero or the Seeed XIAO ESP32-C6,
+//! selected at build time via the `board-waveshare` (default) or
+//! `board-xiao-c6` Cargo feature. Forwards COBS-framed UART data from an
+//! STM32H743 flight controller to raw UDP datagrams over WiFi, and vice
+//! versa. Does not interpret message contents.
 
 #![no_std]
 #![no_main]
+
+#[cfg(all(feature = "board-waveshare", feature = "board-xiao-c6"))]
+compile_error!("select exactly one board feature: board-waveshare OR board-xiao-c6");
+#[cfg(not(any(feature = "board-waveshare", feature = "board-xiao-c6")))]
+compile_error!("select a board feature: board-waveshare or board-xiao-c6");
 
 extern crate alloc;
 extern crate esp_backtrace as _;
@@ -19,17 +26,23 @@ use embassy_futures::select::{self, Either};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{Ipv4Address, Runner, Stack, StackResources};
 use embassy_time::{Ticker, Timer};
+#[cfg(feature = "board-xiao-c6")]
+use esp_hal::gpio::{Level, Output, OutputConfig};
+#[cfg(feature = "board-waveshare")]
 use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::uart::{UartRx, UartTx};
+#[cfg(feature = "board-waveshare")]
 use esp_hal_smartled::SmartLedsAdapter;
 use esp_radio::wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent};
 use log::{info, warn};
+#[cfg(feature = "board-waveshare")]
 use smart_leds::SmartLedsWrite;
 use static_cell::StaticCell;
 
 use cybesp_bridge::mk_static;
 
 /// RMT buffer size for 1 WS2812 LED (24 bits + 1 reset pulse).
+#[cfg(feature = "board-waveshare")]
 const LED_RMT_BUFFER_SIZE: usize = 25;
 
 // ---------------------------------------------------------------------------
@@ -41,7 +54,9 @@ const WIFI_SSID: &str = "UTADR";
 /// WiFi password.
 const WIFI_PASSWORD: &str = "adr2025WIN";
 /// Ground station IP address on the network.
-const GROUND_STATION_IP: Ipv4Address = Ipv4Address::new(192, 168, 50, 101);
+// const GROUND_STATION_IP: Ipv4Address = Ipv4Address::new(192, 168, 50, 101);
+const GROUND_STATION_IP: Ipv4Address = Ipv4Address::new(192, 168, 50, 224); // WIFI
+
 /// UDP port the ground station listens on for downlink telemetry.
 const DOWNLINK_PORT: u16 = 4210;
 /// UDP port this bridge listens on for uplink commands.
@@ -193,11 +208,12 @@ impl FrameAccumulator {
 // LED status task — WS2812 on GPIO8
 // ---------------------------------------------------------------------------
 
-/// LED patterns:
+/// LED patterns (Waveshare WS2812 RGB):
 ///   Booting:           breathing blue
 ///   WiFi connecting:   breathing blue
 ///   WiFi connected:    solid green (dim)
 ///   WiFi disconnected: blinking red
+#[cfg(feature = "board-waveshare")]
 #[embassy_executor::task]
 async fn led_task(mut led: SmartLedsAdapter<'static, LED_RMT_BUFFER_SIZE>) {
     let mut tick: u8 = 0;
@@ -236,11 +252,46 @@ async fn led_task(mut led: SmartLedsAdapter<'static, LED_RMT_BUFFER_SIZE>) {
 }
 
 /// Triangle wave: ramps 0→max→0 over `period` ticks.
+#[cfg(feature = "board-waveshare")]
 fn triangle_wave(tick: u8, max_brightness: u8) -> u8 {
     // period = 2 * 50 ticks = 100 ticks = 5 seconds full cycle at 50ms
     let phase = tick % 100;
     let ramp = if phase < 50 { phase } else { 100 - phase };
     ((ramp as u16 * max_brightness as u16) / 50) as u8
+}
+
+/// Logical "on" level for the XIAO ESP32-C6 user LED (GPIO15). The onboard
+/// LED is active-low (driving the pin LOW lights it). Flip this single const
+/// if a board revision wires it active-high.
+#[cfg(feature = "board-xiao-c6")]
+const LED_ON: Level = Level::Low;
+#[cfg(feature = "board-xiao-c6")]
+const LED_OFF: Level = Level::High;
+
+/// LED patterns (XIAO single monochrome LED on GPIO15 — status conveyed via
+/// blink rate since there is no color):
+///   Booting / WiFi connecting: slow breathe-style blink (~1 Hz)
+///   WiFi connected:            solid on
+///   WiFi disconnected:         fast blink (~5 Hz)
+#[cfg(feature = "board-xiao-c6")]
+#[embassy_executor::task]
+async fn led_task(mut led: Output<'static>) {
+    let mut tick: u8 = 0;
+    loop {
+        let status = BRIDGE_STATUS.load(Ordering::Relaxed);
+        let on = match status {
+            // Slow blink: on for half of a ~1s (20-tick) period.
+            STATUS_BOOTING | STATUS_WIFI_CONNECTING => (tick / 10) % 2 == 0,
+            // Solid on while linked.
+            STATUS_WIFI_CONNECTED => true,
+            // Fast blink (~5 Hz): toggle every 2 ticks (100ms).
+            STATUS_WIFI_DISCONNECTED => (tick / 2) % 2 == 0,
+            _ => false,
+        };
+        led.set_level(if on { LED_ON } else { LED_OFF });
+        tick = tick.wrapping_add(1);
+        Timer::after_millis(50).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -547,12 +598,22 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
 
-    // 5. Init WS2812 LED on GPIO8 via RMT channel 0.
-    let rmt = Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80)).unwrap();
-    static LED_BUF: StaticCell<[PulseCode; LED_RMT_BUFFER_SIZE]> = StaticCell::new();
-    let rmt_buf = LED_BUF.init([PulseCode::default(); LED_RMT_BUFFER_SIZE]);
-    let led = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO8, rmt_buf);
-    spawner.spawn(led_task(led)).unwrap();
+    // 5. Init status LED.
+    #[cfg(feature = "board-waveshare")]
+    {
+        // WS2812 RGB LED on GPIO8 via RMT channel 0.
+        let rmt = Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80)).unwrap();
+        static LED_BUF: StaticCell<[PulseCode; LED_RMT_BUFFER_SIZE]> = StaticCell::new();
+        let rmt_buf = LED_BUF.init([PulseCode::default(); LED_RMT_BUFFER_SIZE]);
+        let led = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO8, rmt_buf);
+        spawner.spawn(led_task(led)).unwrap();
+    }
+    #[cfg(feature = "board-xiao-c6")]
+    {
+        // Single monochrome user LED on GPIO15.
+        let led = Output::new(peripherals.GPIO15, LED_OFF, OutputConfig::default());
+        spawner.spawn(led_task(led)).unwrap();
+    }
 
     // 6. Init UART0 for STM32 communication (921600 baud, 8N1).
     let uart_config = esp_hal::uart::Config::default().with_baudrate(921_600);
@@ -565,16 +626,26 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("cybesp-bridge: UART0 init OK (921600 baud)");
 
-    // 6a. Init UART1 for RTCM3 forwarding to ublox UART2 (115200 baud, TX-only on GPIO14).
+    // 6a. Init UART1 for RTCM3 forwarding to ublox UART2 (115200 baud, TX-only).
     // The ublox doesn't talk back on UART2, so we don't bind an RX pin.
+    // Pin: GPIO14 on Waveshare; GPIO0 on XIAO (GPIO14 is the antenna switch there).
     let rtcm_uart_config = esp_hal::uart::Config::default().with_baudrate(115_200);
-    let rtcm_uart = esp_hal::uart::Uart::new(peripherals.UART1, rtcm_uart_config)
-        .unwrap()
-        .with_tx(peripherals.GPIO14)
-        .into_async();
+    let rtcm_uart_builder = esp_hal::uart::Uart::new(peripherals.UART1, rtcm_uart_config).unwrap();
+    #[cfg(feature = "board-waveshare")]
+    let rtcm_uart = rtcm_uart_builder.with_tx(peripherals.GPIO14).into_async();
+    #[cfg(feature = "board-xiao-c6")]
+    let rtcm_uart = rtcm_uart_builder.with_tx(peripherals.GPIO0).into_async();
     let (_, rtcm_uart_tx) = rtcm_uart.split();
 
     info!("cybesp-bridge: UART1 init OK (115200 baud, RTCM3 → ublox UART2)");
+
+    // 6b. XIAO ESP32-C6 antenna switch: enable the RF switch (GPIO3 LOW) and
+    // select the built-in PCB antenna (GPIO14 LOW). Named bindings keep the
+    // pins driven for the program lifetime (main never returns).
+    #[cfg(feature = "board-xiao-c6")]
+    let _rf_enable = Output::new(peripherals.GPIO3, Level::Low, OutputConfig::default());
+    #[cfg(feature = "board-xiao-c6")]
+    let _ant_select = Output::new(peripherals.GPIO14, Level::Low, OutputConfig::default());
 
     // 7. Init WiFi radio.
     let radio_init = &*mk_static!(

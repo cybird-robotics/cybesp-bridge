@@ -9,6 +9,14 @@ publish = ["utadr"]
 name = "cybesp-bridge"
 path = "./src/bin/main.rs"
 
+[features]
+default = ["board-waveshare"]
+# Waveshare ESP32-C6-Zero: WS2812 RGB LED on GPIO8, RTCM TX on GPIO14.
+board-waveshare = ["dep:esp-hal-smartled", "dep:smart-leds", "dep:rgb"]
+# Seeed XIAO ESP32-C6: monochrome LED on GPIO15, RTCM TX on GPIO0,
+# antenna switch on GPIO3/GPIO14.
+board-xiao-c6 = []
+
 [dependencies]
 # ESP32-C6 HAL
 esp-hal = { version = "~1.0", features = ["esp32c6", "unstable", "log-04"] }
@@ -68,10 +76,10 @@ esp-backtrace = { version = "0.18.1", features = ["esp32c6", "panic-handler", "p
 embedded-io = "0.7"
 embedded-io-async = "0.7"
 
-# Addressable LED (WS2812 on GPIO8)
-esp-hal-smartled = "0.17.0"
-smart-leds = "0.4.0"
-rgb = { version = "0.8", default-features = false }
+# Addressable LED (WS2812 on GPIO8) — Waveshare board only
+esp-hal-smartled = { version = "0.17.0", optional = true }
+smart-leds = { version = "0.4.0", optional = true }
+rgb = { version = "0.8", default-features = false, optional = true }
 
 # COBS framing (same version as cybflight STM32 firmware)
 cobs = { version = "0.5", default-features = false }
