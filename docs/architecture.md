@@ -36,9 +36,9 @@ talks to a fixed ground-station IP (`GROUND_STATION_IP` in `src/bin/main.rs`).
 
 | Direction | Path | Framing | Port |
 |-----------|------|---------|------|
-| **Downlink** (telemetry) | UART0 RX → COBS-decode → UDP → GS | COBS in, raw payload out | → GS :4210 |
+| **Downlink** (telemetry) | UART0 RX → COBS-decode → queue → UDP → GS | COBS in, batch envelope out (one datagram per UART burst) | → GS :4210 |
 | **Uplink** (commands) | UDP → COBS-encode → UART0 TX | raw in, COBS out | bind :4211 |
-| **RTCM uplink** (RTK) | UDP → UART1 TX (verbatim) | none (ublox parses RTCM3) | bind :4212 |
+| **RTCM uplink** (RTK) — **highest priority** | UDP → pipe → UART1 TX (verbatim) | none (receiver parses RTCM3) | bind :4212 |
 | **Time sync (SNTP)** | UDP NTP query → GS NTP server | NTP wire format | → GS :123 |
 | **Time sync (PTP follow-up)** | UART0 TX every 3 s | COBS, msg_id 129 | — |
 
@@ -57,26 +57,62 @@ peripherals then spawns independent Embassy tasks; the main task idles.
 ### Boot sequence (`main`, `src/bin/main.rs`)
 
 1. ESP-HAL init at max CPU clock.
-2. Logger init (`esp-println`, over USB-Serial-JTAG).
-3. Heap allocator (72 KB — required by the WiFi stack).
+2. Logger init (`esp-println`, USB-Serial-JTAG **only** — see below).
+3. Heap allocator (96 KB — the WiFi stack, sized for its enlarged RX queue).
 4. Start the esp-rtos scheduler (TIMG0 + software interrupt).
 5. Init status LED → spawn `led_task`.
-6. Init UART0 (STM32, 921600) and UART1 (ublox RTCM, 115200, TX-only).
-6b. *(XIAO only)* configure the antenna RF switch.
-7–9. Init WiFi radio, create STA interface, configure `embassy-net` with DHCP.
-10. Spawn all tasks.
+6. Init UART0 (STM32, 921600, RX FIFO threshold 32) and UART1 (RTCM, 115200,
+   TX-only). The UART halves that move to interrupt executors stay Blocking here.
+6b. Start the two interrupt executors (SWI1 → RTCM writer, SWI2 → UART0 drain).
+6c. *(XIAO only)* configure the antenna RF switch.
+7–9. Init WiFi radio (power save off, RX/TX queues 12/6), create STA
+   interface, configure `embassy-net` with DHCP.
+10. Spawn the thread-mode tasks.
+
+### Priorities
+
+RTK corrections are the most important traffic on the link: a dropped or late
+correction degrades the RTK solution, while lost telemetry only costs a
+dashboard update. The scheduling follows from that, highest priority first:
+
+| Level | Executor | Tasks | Why |
+|-------|----------|-------|-----|
+| 1 | interrupt, SWI1, `Priority3` | `rtcm_uart_writer_task` | Keeps UART1 saturated; nothing else can delay a correction on its way out. |
+| 2 | interrupt, SWI2, `Priority2` | `uart0_rx_drain_task` | Drains the 128 B UART0 FIFO before it overruns (≥1 ms of headroom at threshold 32). |
+| 3 | thread mode | all network tasks | `embassy-net`'s `Stack` is `!Send`, so socket tasks cannot run on an interrupt executor. |
+
+The interrupt-executor tasks only move bytes between a UART and a static
+queue: no network access, no logging, no sleeps. The async UART driver types
+are `!Send`, so each executor receives its UART half in Blocking mode through a
+small bootstrap task that converts it with `into_async()` in place.
 
 ### Tasks (all `#[embassy_executor::task]`)
 
-| Task | Role |
-|------|------|
-| `wifi_task` | STA connect + auto-reconnect; drives `BRIDGE_STATUS`. |
-| `net_task` | Runs the `embassy-net` stack. |
-| `downlink_task` | UART0 RX → `FrameAccumulator` (COBS decode) → UDP to GS :4210. |
-| `uplink_task` | UDP :4211 → COBS encode → UART0 TX. Also emits PTP time-sync frames every 3 s. |
-| `rtcm_uplink_task` | UDP :4212 → UART1 TX verbatim (no framing). |
-| `sntp_task` | Polls the GS NTP server every 3 s; stores sync point in `NTP_STATE`. |
-| `led_task` | Renders `BRIDGE_STATUS` on the board LED (board-specific). |
+| Task | Executor | Role |
+|------|----------|------|
+| `rtcm_uart_writer_task` | SWI1 | `RTCM_PIPE` → UART1 TX. |
+| `uart0_rx_drain_task` | SWI2 | UART0 RX → `FrameAccumulator` → whole decoded frames into `DL_QUEUE` (drops the oldest when full); marks each burst's end on RX idle. |
+| `rtcm_uplink_task` | thread | UDP :4212 → whole datagram into `RTCM_PIPE`, or drop and count. Does nothing else, so the socket drains even while UART1 shifts out a 1 KB frame (~89 ms). |
+| `downlink_task` | thread | `DL_QUEUE` → one batch datagram per UART burst → GS :4210. |
+| `uplink_task` | thread | UDP :4211 → COBS encode → UART0 TX. Also emits PTP time-sync frames every 3 s. |
+| `wifi_task` | thread | STA connect + auto-reconnect; drives `BRIDGE_STATUS`. |
+| `net_task` | thread | Runs the `embassy-net` stack. |
+| `sntp_task` | thread | Polls the GS NTP server every 3 s; stores sync point in `NTP_STATE`. |
+| `stats_task` | thread | Logs the `STATS` counters every 5 s. |
+| `led_task` | thread | Renders `BRIDGE_STATUS` on the board LED (board-specific). |
+
+### Buffering and loss policy
+
+| Buffer | Size | When full |
+|--------|------|-----------|
+| WiFi driver RX / TX queues | 12 / 6 packets | driver drops silently (sits before smoltcp) |
+| RTCM socket RX | 16 datagrams / 8 KB | smoltcp drops silently |
+| `RTCM_PIPE` → UART1 | 8 KB (~710 ms of line time) | whole datagram dropped, `rtcm_drops` counted |
+| `DL_QUEUE` → WiFi | 64 decoded frames (~250 ms) | oldest frame dropped, counted |
+| Downlink socket TX | 8 datagrams / 4 KB | `send_to` waits; only the downlink task stalls |
+
+Every drop is whole-frame or whole-datagram, never a torn one: the telemetry
+frames carry no CRC, and a spliced frame could decode as valid.
 
 ### Shared state
 
@@ -85,14 +121,47 @@ peripherals then spawns independent Embassy tasks; the main task idles.
 - `NTP_STATE: Mutex<RefCell<Option<(i64, i64)>>>` — `(ntp_us, capture_instant_us)`.
   Written by `sntp_task`, read by `uplink_task` via `get_ntp_time_us()` which
   extrapolates from the monotonic clock between SNTP queries.
+- `DL_QUEUE` (`embassy_sync::Channel`) and `RTCM_PIPE` (`embassy_sync::Pipe`,
+  exactly one writer) — the hand-offs between the interrupt executors and the
+  network tasks.
+- `STATS: BridgeStats` — cumulative `AtomicU32` counters: UART0 errors, COBS
+  errors, queue drops and high-water marks, datagrams sent, RTCM received /
+  dropped / bytes to UART1. Logged every 5 s; four of them ride in every
+  downlink batch header, so `cybgcs` shows them per drone without a USB log.
 
 ### Wire protocol (COBS)
 
 The UART0 leg uses **COBS** framing (0x00 delimiter), matching the cybflight
 STM32 firmware. Raw frame layout: `[msg_id: u8][seq: u8][payload ≤ 128 B]`
 (`MAX_RAW_FRAME = 130`). `FrameAccumulator::feed()` decodes incoming bytes
-in-place on each 0x00. The RTCM leg is **unframed** — bytes go straight to the
-ublox, which validates RTCM3 itself (length + CRC24Q).
+in-place on each 0x00; after a UART error or an oversized frame it discards
+through the next delimiter rather than decode a partial frame. The RTCM leg is
+**unframed** — bytes go straight to the receiver, which validates RTCM3 itself
+(length + CRC24Q).
+
+### Downlink batch envelope
+
+Each UART burst from the STM32 (one per 10 ms tick) leaves as **one** UDP
+datagram, defined in `cybflight_msgs::udp_batch`:
+
+```
+[0x00][version=1][uart_errors u16][dl_drops u16][rtcm_rx u16][rtcm_drops u16]
+([len u8][frame: msg_id, seq, payload])*
+```
+
+msg_id 0 is reserved, so the first byte tells a batch from a legacy
+single-frame datagram; `cybgcs` accepts both. A batch is flushed when the
+UART goes idle on a frame boundary, after 1.5 ms without a frame, after 8 ms,
+or at 1400 B. Set `DOWNLINK_BATCHING = false` to send one frame per datagram
+for a ground station that predates the envelope — such a GCS discards batches.
+
+### Logging
+
+`esp-println` is built with `jtag-serial` only. Its default `auto` printer
+falls back to UART0 whenever no USB host has been attached, and UART0 is the
+STM32 link: every log line would be injected into the flight controller's
+uplink. The default `critical-section` feature is also off, since it masked
+interrupts for each print and would stall the high-priority UART tasks.
 
 ### Time sync (NTP + PTP follow-up)
 
@@ -141,7 +210,7 @@ color fields are remapped — see `led_task`.)
 | UART1 TX → ublox (RTCM3) | GPIO0 | D0 | 115200, TX-only (GPIO14 is the antenna switch) |
 | Status LED (user) | GPIO15 | — | single **monochrome** LED, **active-low**, blink-rate status |
 | RF switch enable | GPIO3 | — | held LOW |
-| Antenna select | GPIO14 | — | held LOW = built-in PCB antenna (HIGH = external u.FL) |
+| Antenna select | GPIO14 | — | held LOW = built-in PCB antenna (HIGH = external u.FL) — must match the fitted hardware, see [board_info.md](board_info.md#xiao-antenna-selection) |
 
 LED patterns (no color → status by blink rate): slow ~1 Hz blink =
 booting/connecting, **solid on = connected**, fast ~5 Hz blink = disconnected.

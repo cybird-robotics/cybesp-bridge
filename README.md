@@ -18,8 +18,12 @@ UDP TX :4211  ────► UDP datagram ───► COBS encode ──► UA
 ```
 
 - **Downlink** (telemetry): STM32 sends COBS-encoded frames over UART at
-  921600 baud. The ESP32 decodes COBS framing and sends each decoded frame as
-  a UDP datagram to the ground station on port 4210.
+  921600 baud, one burst per 10 ms tick. The ESP32 decodes COBS framing and
+  sends each burst as one batch datagram to the ground station on port 4210.
+- **RTCM** (RTK corrections, **highest priority**): the ground station sends
+  RTCM3 to port 4212; the ESP32 writes it verbatim to the GNSS receiver on
+  UART1 from its highest-priority executor. See
+  [docs/architecture.md](docs/architecture.md#priorities).
 - **Uplink** (position commands): The ground station sends raw datagrams to
   the ESP32 on port 4211. The ESP32 COBS-encodes each datagram and writes it
   to UART.
@@ -115,8 +119,13 @@ The bridge treats this as an opaque byte sequence — it does not inspect
 
 ### UDP (WiFi leg)
 
-Each UDP datagram carries exactly one decoded frame (no COBS, no delimiter).
-The datagram payload is the raw `[msg_id][seq][payload]` bytes.
+Each downlink datagram carries one UART burst as a batch envelope
+(`cybflight_msgs::udp_batch`): a `0x00` marker, a version byte, four bridge
+counters (UART errors, telemetry drops, RTCM received, RTCM dropped), then
+`[len: u8][msg_id][seq][payload]` per frame. msg_id 0 is reserved, so a
+ground station tells a batch from a legacy single-frame datagram by its first
+byte. Set `DOWNLINK_BATCHING = false` in `src/bin/main.rs` to send one raw
+frame per datagram for a ground station that predates the envelope.
 
 ### Ports
 
