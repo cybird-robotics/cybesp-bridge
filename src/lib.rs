@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod board;
+
 #[macro_export]
 macro_rules! mk_static {
     ($t:ty, $val:expr) => {{

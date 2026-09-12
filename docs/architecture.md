@@ -28,7 +28,8 @@ selected at build time via a Cargo feature; see [Boards & Pinout](#boards--pinou
 ```
 
 The bridge joins a WiFi network in **STA mode**, obtains an IP via **DHCP**, and
-talks to a fixed ground-station IP (`GROUND_STATION_IP` in `src/bin/main.rs`).
+learns the ground station's IP from the ground station's own traffic; see
+[Ground station discovery](#ground-station-discovery).
 
 ---
 
@@ -43,8 +44,32 @@ talks to a fixed ground-station IP (`GROUND_STATION_IP` in `src/bin/main.rs`).
 | **Time sync (PTP follow-up)** | UART0 TX every 3 s | COBS, msg_id 129 | — |
 
 Key constants live at the top of `src/bin/main.rs`: `WIFI_SSID`,
-`WIFI_PASSWORD`, `GROUND_STATION_IP`, `DOWNLINK_PORT` (4210), `UPLINK_PORT`
-(4211), `RTCM_UPLINK_PORT` (4212).
+`WIFI_PASSWORD`, `DOWNLINK_PORT` (4210), `UPLINK_PORT` (4211),
+`RTCM_UPLINK_PORT` (4212).
+
+### Ground station discovery and uplink lock
+
+The ground station's IP is not configured, so any PC running `cybgcs` works
+without reflashing. The first sender of a datagram to :4211 or :4212 becomes
+the ground station (`accept_uplink`, stored in `GS_IP`), and telemetry (:4210)
+and SNTP queries (:123) go there. `cybgcs` sends every drone a 10 Hz
+fleet-state datagram from startup, so the bridge finds it within about 100 ms;
+until then the downlink discards telemetry and SNTP waits.
+
+The bridge then belongs to that ground station. Datagrams to :4211 or :4212
+from any other sender are dropped before the flight controller sees them, and
+counted (`uplink_foreign_drops`, in the stats log). The firmware ignores
+sequence numbers, so it can't tell two ground stations' fleet states, Vicon
+poses, origins or RTCM streams apart; without the lock, a second `cybgcs`
+would interleave its own with the first one's. The rejected sender gets a busy
+notice on its :4210 (`[0x00][0x80][owner IPv4]`, see
+`cybflight_msgs::udp_batch`), at most once a second, which `cybgcs` shows as
+`taken`. Another sender takes over only after the owner has been silent for
+3 s (`GS_HANDOVER`).
+
+Other PCs watch through the ground station instead (`cybgcs tui --observe`,
+see the README): it forwards the drones' datagrams over the LAN, so the
+drones' radio traffic doesn't grow with the number of viewers.
 
 ---
 
@@ -59,12 +84,12 @@ peripherals then spawns independent Embassy tasks; the main task idles.
 1. ESP-HAL init at max CPU clock.
 2. Logger init (`esp-println`, USB-Serial-JTAG **only** — see below).
 3. Heap allocator (96 KB — the WiFi stack, sized for its enlarged RX queue).
-4. Start the esp-rtos scheduler (TIMG0 + software interrupt).
-5. Init status LED → spawn `led_task`.
-6. Init UART0 (STM32, 921600, RX FIFO threshold 32) and UART1 (RTCM, 115200,
-   TX-only). The UART halves that move to interrupt executors stay Blocking here.
-6b. Start the two interrupt executors (SWI1 → RTCM writer, SWI2 → UART0 drain).
-6c. *(XIAO only)* configure the antenna RF switch.
+4. `board::init`: the board claims its UARTs and pins (STM32 link at 921600,
+   RX FIFO threshold 32; GNSS UART at 115200, TX-only), sets up its status LED
+   and antenna, and returns the rest. The UART halves stay Blocking here.
+5. Start the esp-rtos scheduler (TIMG0 + software interrupt); spawn `led_task`.
+6. Start the interrupt executors: SWI1 → RTCM writer (only if the board has a
+   GNSS UART), SWI2 → STM32 link drain.
 7–9. Init WiFi radio (power save off, RX/TX queues 12/6), create STA
    interface, configure `embassy-net` with DHCP.
 10. Spawn the thread-mode tasks.
@@ -78,7 +103,7 @@ dashboard update. The scheduling follows from that, highest priority first:
 | Level | Executor | Tasks | Why |
 |-------|----------|-------|-----|
 | 1 | interrupt, SWI1, `Priority3` | `rtcm_uart_writer_task` | Keeps UART1 saturated; nothing else can delay a correction on its way out. |
-| 2 | interrupt, SWI2, `Priority2` | `uart0_rx_drain_task` | Drains the 128 B UART0 FIFO before it overruns (≥1 ms of headroom at threshold 32). |
+| 2 | interrupt, SWI2, `Priority2` | `fc_rx_drain_task` | Drains the STM32 link's 128 B UART FIFO before it overruns (≥1 ms of headroom at threshold 32). |
 | 3 | thread mode | all network tasks | `embassy-net`'s `Stack` is `!Send`, so socket tasks cannot run on an interrupt executor. |
 
 The interrupt-executor tasks only move bytes between a UART and a static
@@ -91,7 +116,7 @@ small bootstrap task that converts it with `into_async()` in place.
 | Task | Executor | Role |
 |------|----------|------|
 | `rtcm_uart_writer_task` | SWI1 | `RTCM_PIPE` → UART1 TX. |
-| `uart0_rx_drain_task` | SWI2 | UART0 RX → `FrameAccumulator` → whole decoded frames into `DL_QUEUE` (drops the oldest when full); marks each burst's end on RX idle. |
+| `fc_rx_drain_task` | SWI2 | STM32 link RX → `FrameAccumulator` → whole decoded frames into `DL_QUEUE` (drops the oldest when full); marks each burst's end on RX idle. |
 | `rtcm_uplink_task` | thread | UDP :4212 → whole datagram into `RTCM_PIPE`, or drop and count. Does nothing else, so the socket drains even while UART1 shifts out a 1 KB frame (~89 ms). |
 | `downlink_task` | thread | `DL_QUEUE` → one batch datagram per UART burst → GS :4210. |
 | `uplink_task` | thread | UDP :4211 → COBS encode → UART0 TX. Also emits PTP time-sync frames every 3 s. |
@@ -99,7 +124,7 @@ small bootstrap task that converts it with `into_async()` in place.
 | `net_task` | thread | Runs the `embassy-net` stack. |
 | `sntp_task` | thread | Polls the GS NTP server every 3 s; stores sync point in `NTP_STATE`. |
 | `stats_task` | thread | Logs the `STATS` counters every 5 s. |
-| `led_task` | thread | Renders `BRIDGE_STATUS` on the board LED (board-specific). |
+| `led_task` | thread | Passes `BRIDGE_STATUS` to the board's `StatusLed` every 50 ms; the board picks the pattern. |
 
 ### Buffering and loss policy
 
@@ -210,7 +235,7 @@ color fields are remapped — see `led_task`.)
 | UART1 TX → ublox (RTCM3) | GPIO0 | D0 | 115200, TX-only (GPIO14 is the antenna switch) |
 | Status LED (user) | GPIO15 | — | single **monochrome** LED, **active-low**, blink-rate status |
 | RF switch enable | GPIO3 | — | held LOW |
-| Antenna select | GPIO14 | — | held LOW = built-in PCB antenna (HIGH = external u.FL) — must match the fitted hardware, see [board_info.md](board_info.md#xiao-antenna-selection) |
+| Antenna select | GPIO14 | — | LOW = built-in PCB antenna (default); HIGH = external u.FL with the `ext-antenna` feature — must match the fitted hardware, see [board_info.md](board_info.md#xiao-antenna-selection) |
 
 LED patterns (no color → status by blink rate): slow ~1 Hz blink =
 booting/connecting, **solid on = connected**, fast ~5 Hz blink = disconnected.
@@ -231,17 +256,35 @@ LED polarity is in the single `LED_ON` / `LED_OFF` const.
 
 ### How board differences are implemented
 
-All divergence is `#[cfg(feature = ...)]`-gated in `src/bin/main.rs` at three
-sites — there is no separate board-abstraction module:
+Everything board-specific lives in `src/board/`, one file per board. The board
+feature picks the file in `src/board/mod.rs`, the only board `cfg` in the
+crate, and `build.rs` fails the build unless exactly one `board-*` feature is
+enabled.
 
-1. **LED** — two cfg-gated `led_task` variants (WS2812 `SmartLedsAdapter` vs
-   plain `Output`) and two cfg-gated init blocks in `main`. Embassy tasks don't
-   play well with generics, so two concrete functions are used instead of a trait.
-2. **RTCM UART1 TX pin** — `.with_tx(GPIO14)` (Waveshare) vs `.with_tx(GPIO0)` (XIAO).
-3. **Antenna** — XIAO-only block driving GPIO3/GPIO14 before WiFi init.
+Each board file provides the same items:
+
+- `NAME`, logged at boot.
+- `init(Peripherals, LinkConfig) -> Board`: claims the board's UARTs and pins,
+  sets up its LED and antenna, and returns a `Board` holding the STM32 link
+  halves (`fc_rx`, `fc_tx`), the GNSS TX half (`gnss_tx`, `None` on a board
+  with no UART to spare), the `StatusLed`, and the peripherals the application
+  still needs (WiFi, TIMG0, software interrupts).
+- `StatusLed::show(LinkStatus, tick)`, called by the single `led_task` every
+  `board::LED_TICK_MS` (50 ms).
+
+The **board** decides which UART instance and pins carry each link. The
+**application** decides the link settings (`LinkConfig`: baud rates, FIFO
+threshold) and never names a GPIO or UART instance. esp-hal 1.0's UART driver
+types don't depend on the instance or the pins, so every board returns the
+same types and the tasks don't change per board.
+
+Board options are features the board file checks: `ext-antenna` selects the
+XIAO's u.FL connector, and is a compile error on the Waveshare.
 
 The RGB-only deps (`esp-hal-smartled`, `smart-leds`, `rgb`) are **optional** and
 pulled in only by `board-waveshare`, so the XIAO build doesn't compile them.
+
+To add a board, see [board_info.md](board_info.md#adding-a-board).
 
 ---
 
@@ -256,6 +299,9 @@ cargo run --release
 
 # Seeed XIAO ESP32-C6
 cargo run --release --no-default-features --features board-xiao-c6
+
+# Seeed XIAO ESP32-C6 with an external u.FL antenna fitted
+cargo run --release --no-default-features --features board-xiao-c6,ext-antenna
 ```
 
 On the XIAO, if it boots into download mode, power-cycle and run

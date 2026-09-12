@@ -2,8 +2,9 @@
 
 Message-agnostic WiFi-UART bridge for the cybflight flight controller.
 
-Runs on a **Waveshare ESP32-C6-Zero** and forwards COBS-framed UART data from
-an STM32H743 to raw UDP datagrams over WiFi, and vice versa. The bridge does
+Runs on ESP32-C6 boards (Waveshare ESP32-C6-Zero, Seeed XIAO ESP32-C6) and
+forwards COBS-framed UART data from an STM32H743 to UDP over WiFi, and vice
+versa. The bridge does
 not interpret message contents — if new telemetry types are added to the flight
 controller firmware, the bridge does not need reflashing.
 
@@ -33,7 +34,8 @@ UDP TX :4211  ────► UDP datagram ───► COBS encode ──► UA
 Two boards are supported, selected at build time via a Cargo feature
 (`board-waveshare`, the default, or `board-xiao-c6`). Both use the ESP32-C6
 MCU and native USB for programming/logging. Only the RTCM pin, status LED, and
-antenna handling differ.
+antenna handling differ. Each board's wiring lives in its own file under
+`src/board/`; to add a board, see [docs/board_info.md](docs/board_info.md#adding-a-board).
 
 | Function | Connects to | Waveshare ESP32-C6-Zero | Seeed XIAO ESP32-C6 |
 |----------|-------------|-------------------------|---------------------|
@@ -41,7 +43,7 @@ antenna handling differ.
 | UART0 RX | STM32 USART6 TX (PC6) | GPIO17 | GPIO17 (D7) |
 | UART1 TX | ublox UART2 (RTCM3 in) | GPIO14 | GPIO0 (D0) |
 | Status LED | onboard | WS2812 RGB on GPIO8 | mono LED on GPIO15 |
-| Antenna | onboard | fixed | GPIO3=LOW + GPIO14=LOW (built-in PCB) |
+| Antenna | onboard | fixed | GPIO3=LOW + GPIO14=LOW (built-in PCB); GPIO14=HIGH (external u.FL) with `ext-antenna` |
 | GND | STM32 GND | GND | GND |
 
 UART0 configuration: 921600 baud, 8N1, no flow control. UART1: 115200 baud,
@@ -68,16 +70,88 @@ GPIO0.
 
 ## Configuration
 
-Edit the constants in `src/bin/main.rs`:
+Two settings are fixed at build time, so rebuild and reflash after changing
+either:
+
+| Setting | Where to set it |
+|---------|-----------------|
+| ESP32 board (and antenna) | Cargo feature on the build command — see [Board](#board) |
+| WiFi network name and password | `WIFI_SSID`, `WIFI_PASSWORD` in `src/bin/main.rs` |
+
+The ground station's IP is **not** configured anywhere: the bridge learns it
+while running. See [Ground station](#ground-station).
+
+### Board
+
+Choose exactly one board feature when building (commands in
+[Building & Flashing](#building--flashing)):
+
+| Board | Features |
+|-------|----------|
+| Waveshare ESP32-C6-Zero | `board-waveshare` (the default) |
+| Seeed XIAO ESP32-C6, built-in antenna | `board-xiao-c6` |
+| Seeed XIAO ESP32-C6, external u.FL antenna fitted | `board-xiao-c6,ext-antenna` |
+
+A build with no board or with two boards fails with an error saying so. Only
+use `ext-antenna` when an antenna is actually plugged in; see
+[docs/board_info.md](docs/board_info.md#xiao-antenna-selection). The boot log
+prints which board the firmware was built for.
+
+### WiFi
+
+Edit the constants near the top of `src/bin/main.rs`:
 
 ```rust
-const WIFI_SSID: &str = "TODO_YOUR_SSID";
-const WIFI_PASSWORD: &str = "TODO_YOUR_PASSWORD";
-const GROUND_STATION_IP: Ipv4Address = Ipv4Address::new(192, 168, 1, 100);
+const WIFI_SSID: &str = "YOUR_SSID";
+const WIFI_PASSWORD: &str = "YOUR_PASSWORD";
 ```
 
-Both the ESP32 and ground station must be on the same WiFi network. The ESP32
-obtains its IP via DHCP.
+The bridge joins this network and gets its own IP by DHCP. `cybgcs`
+identifies each drone by its bridge's IP, so reserve a fixed address for every
+bridge in the router and list those addresses in the `cybgcs` fleet config.
+These values are compiled in and committed with the source, so everyone with
+access to this repo can see the WiFi password.
+
+### Ground station
+
+Nothing to set on the bridge, so any teammate's PC on the same WiFi works
+without reflashing. From the moment it starts, `cybgcs` sends every drone a
+fleet-state datagram 10 times a second. The bridge takes the sender of the
+first datagram it receives on port 4211 or 4212 as its ground station, and
+sends telemetry there.
+
+- **Start `cybgcs` to get telemetry.** Until the bridge has heard from a
+  ground station it has nowhere to send telemetry and discards it; its log
+  shows `Downlink: waiting to hear from the ground station`.
+- **One ground station per drone.** The bridge belongs to the first ground
+  station it hears and ignores every other PC: their commands, Vicon poses,
+  origin and RTK corrections are dropped before they reach the flight
+  controller, so a second `cybgcs` started by mistake can't interfere. The
+  bridge tells that PC which ground station owns it, about once a second, and
+  its `cybgcs` shows the drone as `taken` with the owner's IP. Another PC takes
+  over only after the owner has been silent for 3 seconds, for example after
+  it quits.
+- **The ground station is also the NTP server** (UDP 123), so its PC must run
+  one for time sync to work.
+- Anything on the WiFi that sends to a bridge's port 4211 or 4212 while it has
+  no active ground station becomes its ground station; the WiFi password is
+  the only protection.
+
+### Watching from another PC
+
+To see the drones from a second PC, watch through the ground station instead
+of starting another one. The drones then send nothing extra:
+
+- **Full dashboard:** `cybgcs tui --observe <ground station IP>`. The ground
+  station forwards every drone's telemetry to this PC, which sends nothing to
+  the drones (its uplink panes are disabled).
+- **Plots only:** `rerun rerun+http://<ground station IP>:9876/proxy` opens the
+  ground station's own Rerun stream, without the TUI health dashboard. The
+  ground station's firewall must allow TCP 9876.
+
+Either way the copies cross the network: if both PCs are on the drones' WiFi,
+they share the drones' channel. Put ground-station PCs on Ethernet where you
+can.
 
 ## Building & Flashing
 
@@ -93,6 +167,9 @@ cargo run --release                 # build + flash + monitor
 # --- Seeed XIAO ESP32-C6 ---
 cargo build --release --no-default-features --features board-xiao-c6
 cargo run   --release --no-default-features --features board-xiao-c6
+
+# --- Seeed XIAO ESP32-C6 with an external u.FL antenna fitted ---
+cargo run   --release --no-default-features --features board-xiao-c6,ext-antenna
 ```
 
 Log output appears in the monitor via USB serial. Set verbosity via the
@@ -133,3 +210,5 @@ frame per datagram for a ground station that predates the envelope.
 |------|-----------|-------------|
 | 4210 | ESP32 → Ground | Downlink telemetry |
 | 4211 | Ground → ESP32 | Uplink commands (e.g. Vicon pose) |
+| 4212 | Ground → ESP32 | RTCM3 corrections for the GNSS receiver |
+| 123 | ESP32 → Ground | NTP time sync (the ground station runs the NTP server) |

@@ -1,27 +1,25 @@
 //! cybesp-bridge — Message-agnostic WiFi↔UART bridge for cybflight.
 //!
-//! Runs on either the Waveshare ESP32-C6-Zero or the Seeed XIAO ESP32-C6,
-//! selected at build time via the `board-waveshare` (default) or
-//! `board-xiao-c6` Cargo feature. Forwards COBS-framed UART data from an
-//! STM32H743 flight controller to UDP over WiFi, and vice versa, and feeds
-//! RTK corrections to the GNSS receiver. Does not interpret message contents.
+//! Forwards COBS-framed UART data from an STM32H743 flight controller to UDP
+//! over WiFi, and vice versa, and feeds RTK corrections to the GNSS receiver.
+//! Does not interpret message contents.
+//!
+//! Runs on several ESP32 boards. A `board-*` Cargo feature selects one, and
+//! everything board-specific (which UART and pins carry each link, the status
+//! LED, the antenna) lives in `cybesp_bridge::board`; this file only uses the
+//! links by role.
 //!
 //! Scheduling, highest priority first:
-//! 1. RTCM corrections → UART1 → GNSS receiver (`rtcm_uart_writer_task`,
+//! 1. RTCM corrections → GNSS UART → GNSS receiver (`rtcm_uart_writer_task`,
 //!    interrupt executor on SWI1). Every correction counts for RTK.
-//! 2. UART0 receive drain from the STM32 (`uart0_rx_drain_task`, interrupt
-//!    executor on SWI2). A late drain overruns the 128 B hardware FIFO.
+//! 2. Receive drain of the STM32 link (`fc_rx_drain_task`, interrupt executor
+//!    on SWI2). A late drain overruns the 128 B hardware FIFO.
 //! 3. Everything network-facing (thread mode). embassy-net's stack is `!Send`,
 //!    so socket tasks cannot leave the thread executor; they are decoupled
 //!    from the UARTs by static queues instead, and never block them.
 
 #![no_std]
 #![no_main]
-
-#[cfg(all(feature = "board-waveshare", feature = "board-xiao-c6"))]
-compile_error!("select exactly one board feature: board-waveshare OR board-xiao-c6");
-#[cfg(not(any(feature = "board-waveshare", feature = "board-xiao-c6")))]
-compile_error!("select a board feature: board-waveshare or board-xiao-c6");
 
 extern crate alloc;
 extern crate esp_backtrace as _;
@@ -35,34 +33,23 @@ use cybflight_msgs::wire::FRAME_HEADER_SIZE;
 use embassy_executor::Spawner;
 use embassy_futures::select::{self, Either};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_net::{Ipv4Address, Runner, Stack, StackResources};
+use embassy_net::{IpAddress, IpEndpoint, Ipv4Address, Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, TrySendError};
 use embassy_sync::pipe::Pipe;
 use embassy_time::{Duration, Instant, Ticker, Timer};
-#[cfg(feature = "board-xiao-c6")]
-use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::interrupt::Priority;
-#[cfg(feature = "board-waveshare")]
-use esp_hal::rmt::{PulseCode, Rmt};
-use esp_hal::uart::{RxConfig, UartRx, UartTx};
+use esp_hal::uart::{self, RxConfig, UartRx, UartTx};
 use esp_hal::{Async, Blocking};
-#[cfg(feature = "board-waveshare")]
-use esp_hal_smartled::SmartLedsAdapter;
 use esp_radio::wifi::{
     ClientConfig, ModeConfig, PowerSaveMode, WifiController, WifiDevice, WifiEvent,
 };
 use esp_rtos::embassy::InterruptExecutor;
 use log::{info, warn};
-#[cfg(feature = "board-waveshare")]
-use smart_leds::SmartLedsWrite;
 use static_cell::StaticCell;
 
+use cybesp_bridge::board::{self, LinkStatus};
 use cybesp_bridge::mk_static;
-
-/// RMT buffer size for 1 WS2812 LED (24 bits + 1 reset pulse).
-#[cfg(feature = "board-waveshare")]
-const LED_RMT_BUFFER_SIZE: usize = 25;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -72,18 +59,23 @@ const LED_RMT_BUFFER_SIZE: usize = 25;
 const WIFI_SSID: &str = "UTADR";
 /// WiFi password.
 const WIFI_PASSWORD: &str = "adr2025WIN";
-/// Ground station IP address on the network.
-// const GROUND_STATION_IP: Ipv4Address = Ipv4Address::new(192, 168, 50, 101);
-const GROUND_STATION_IP: Ipv4Address = Ipv4Address::new(192, 168, 50, 224); // WIFI
+// The ground station's IP is not configured: the bridge learns it from the
+// ground station's own traffic (see "Ground station discovery").
 
 /// UDP port the ground station listens on for downlink telemetry.
 const DOWNLINK_PORT: u16 = 4210;
 /// UDP port this bridge listens on for uplink commands.
 const UPLINK_PORT: u16 = 4211;
-/// UDP port this bridge listens on for RTCM3 corrections destined for
-/// the ublox GPS UART2. Datagrams are written verbatim to UART1 — no
-/// COBS, no framing. The ublox parses RTCM3 itself (length + CRC24Q).
+/// UDP port this bridge listens on for RTCM3 corrections for the GNSS
+/// receiver. Datagrams are written verbatim to the GNSS UART — no COBS, no
+/// framing. The receiver parses RTCM3 itself (length + CRC24Q).
 const RTCM_UPLINK_PORT: u16 = 4212;
+
+/// STM32 link baud rate (8N1, no flow control); must match the flight
+/// controller.
+const FC_UART_BAUD: u32 = 921_600;
+/// GNSS UART baud rate (TX only); must match the receiver's RTCM input port.
+const GNSS_UART_BAUD: u32 = 115_200;
 
 // ---------------------------------------------------------------------------
 // COBS framing constants (matches cybflight wire format)
@@ -98,17 +90,17 @@ const MAX_COBS_BUF: usize = cobs::max_encoding_length(MAX_RAW_FRAME) + 1;
 // Link scheduling and buffering (see the module docs for the priority order)
 // ---------------------------------------------------------------------------
 
-/// Interrupt priority of the RTCM → UART1 writer (SWI1): the highest used.
+/// Interrupt priority of the RTCM → GNSS UART writer (SWI1): the highest used.
 const RTCM_PRIO: Priority = Priority::Priority3;
-/// Interrupt priority of the UART0 receive drain (SWI2). Both executors sit
+/// Interrupt priority of the STM32 link receive drain (SWI2). Both executors sit
 /// above the esp-rtos timer / scheduler and the UART driver interrupts
 /// (Priority1), so their tasks must stay a few microseconds per poll.
 const DRAIN_PRIO: Priority = Priority::Priority2;
 
-/// UART0 RX FIFO-full wake threshold, in bytes of the 128 B FIFO. The driver
-/// default (120) leaves 8 bytes — ~87 µs at 921600 baud — to wake and drain
-/// during a burst; 32 leaves 96 bytes, ~1 ms.
-const UART0_RX_FIFO_THRESHOLD: u16 = 32;
+/// STM32 link RX FIFO-full wake threshold, in bytes of the 128 B FIFO. The
+/// driver default (120) leaves 8 bytes — ~87 µs at 921600 baud — to wake and
+/// drain during a burst; 32 leaves 96 bytes, ~1 ms.
+const FC_RX_FIFO_THRESHOLD: u16 = 32;
 
 /// Decoded telemetry frames queued between the UART0 drain and the WiFi
 /// sender: ~250 ms of full-rate downlink. When full, the OLDEST frame goes.
@@ -132,7 +124,7 @@ const DL_SOCK_TX_BUF: usize = 4096;
 /// ms, and smoltcp drops silently once slots or bytes run out.
 const RTCM_SOCK_RX_META: usize = 16;
 const RTCM_SOCK_RX_BUF: usize = 8192;
-/// Bytes queued for UART1: ~710 ms of line time at 115200 baud.
+/// Bytes queued for the GNSS UART: ~710 ms of line time at 115200 baud.
 const RTCM_PIPE_SIZE: usize = 8192;
 
 /// WiFi driver packet queues (esp-radio defaults: 5 RX / 3 TX). The RX queue
@@ -165,18 +157,18 @@ enum DlItem {
 
 /// UART0 drain → downlink sender.
 static DL_QUEUE: Channel<CriticalSectionRawMutex, DlItem, DL_QUEUE_LEN> = Channel::new();
-/// Set once the downlink socket is up; the drain discards frames before that
-/// rather than counting boot-time frames as drops.
+/// Set once the downlink socket is up and the ground station is known; the
+/// drain discards frames before that rather than counting them as drops.
 static DL_ACTIVE: AtomicBool = AtomicBool::new(false);
-/// RTCM receiver → UART1 writer. Exactly ONE writer (`rtcm_uplink_task`):
+/// RTCM receiver → GNSS UART writer. Exactly ONE writer (`rtcm_uplink_task`):
 /// `rtcm_enqueue`'s capacity check-then-write is race-free only because of it.
 static RTCM_PIPE: Pipe<CriticalSectionRawMutex, RTCM_PIPE_SIZE> = Pipe::new();
 
 /// Cumulative counters. Logged every `STATS_PERIOD`; four of them also ride
 /// in every downlink batch header so the ground station sees them.
 struct BridgeStats {
-    uart0_rx_errors: AtomicU32,
-    uart0_rx_bytes: AtomicU32,
+    fc_rx_errors: AtomicU32,
+    fc_rx_bytes: AtomicU32,
     dl_cobs_errors: AtomicU32,
     dl_queue_drops: AtomicU32,
     dl_queue_hwm: AtomicU32,
@@ -189,13 +181,15 @@ struct BridgeStats {
     rtcm_recv_errors: AtomicU32,
     rtcm_pipe_hwm: AtomicU32,
     rtcm_uart_bytes: AtomicU32,
+    /// Uplink and RTCM datagrams from a sender other than the ground station.
+    uplink_foreign_drops: AtomicU32,
 }
 
 impl BridgeStats {
     const fn new() -> Self {
         Self {
-            uart0_rx_errors: AtomicU32::new(0),
-            uart0_rx_bytes: AtomicU32::new(0),
+            fc_rx_errors: AtomicU32::new(0),
+            fc_rx_bytes: AtomicU32::new(0),
             dl_cobs_errors: AtomicU32::new(0),
             dl_queue_drops: AtomicU32::new(0),
             dl_queue_hwm: AtomicU32::new(0),
@@ -208,6 +202,7 @@ impl BridgeStats {
             rtcm_recv_errors: AtomicU32::new(0),
             rtcm_pipe_hwm: AtomicU32::new(0),
             rtcm_uart_bytes: AtomicU32::new(0),
+            uplink_foreign_drops: AtomicU32::new(0),
         }
     }
 
@@ -215,7 +210,7 @@ impl BridgeStats {
     fn header(&self) -> BatchHeader {
         let g = |c: &AtomicU32| c.load(Ordering::Relaxed) as u16;
         BatchHeader {
-            uart_errors: g(&self.uart0_rx_errors),
+            uart_errors: g(&self.fc_rx_errors),
             dl_drops: g(&self.dl_queue_drops).wrapping_add(g(&self.dl_cobs_errors)),
             rtcm_rx: g(&self.rtcm_rx_dgrams),
             rtcm_drops: g(&self.rtcm_drops),
@@ -240,16 +235,109 @@ async fn wait_for_network(stack: Stack<'static>, who: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Ground station discovery and uplink lock
+// ---------------------------------------------------------------------------
+//
+// The ground station's address is not configured, so any PC running cybgcs
+// works without reflashing the bridges. The bridge learns it from what the
+// ground station sends to the uplink ports: cybgcs's 10 Hz fleet broadcast
+// reaches every drone from startup, and Vicon poses, RTCM corrections and
+// ping replies count too. Telemetry and NTP queries go to that address.
+//
+// The bridge then belongs to that ground station: uplink and RTCM datagrams
+// from anyone else are dropped (`uplink_foreign_drops`). The flight
+// controller cannot tell two ground stations' streams apart, so a second
+// cybgcs started by mistake would otherwise interleave its own fleet state,
+// Vicon poses, origin and corrections with the first one's. The rejected
+// sender gets a busy notice naming the owner (`udp_batch::busy_notice`, at
+// most one per `BUSY_NOTICE_PERIOD`), which cybgcs shows its operator.
+//
+// Another sender takes over only once the owner has been silent for
+// `GS_HANDOVER` (it quit, crashed or lost WiFi). Anything that sends to the
+// uplink ports counts as a ground station, including a standalone RTCM source
+// or another drone's bridge should one ever send there directly.
+
+/// Silence after which another sender may take over as the ground station.
+const GS_HANDOVER: Duration = Duration::from_secs(3);
+/// Minimum interval between busy notices, to any rejected sender.
+const BUSY_NOTICE_PERIOD: Duration = Duration::from_secs(1);
+/// TX buffer of the uplink and RTCM sockets: room for one busy notice.
+const NOTICE_TX_BUF: usize = 16;
+
+/// Ground station IPv4 address (`Ipv4Address::to_bits`); 0 until learned.
+static GS_IP: AtomicU32 = AtomicU32::new(0);
+/// When the ground station was last heard from: ms since boot, wrapping.
+static GS_LAST_HEARD_MS: AtomicU32 = AtomicU32::new(0);
+/// When the last busy notice went out (ms since boot, wrapping), once one has.
+static BUSY_LAST_MS: AtomicU32 = AtomicU32::new(0);
+static BUSY_SENT: AtomicBool = AtomicBool::new(false);
+
+fn now_ms() -> u32 {
+    Instant::now().as_millis() as u32
+}
+
+/// The ground station's address, once it has been heard from.
+fn ground_station() -> Option<Ipv4Address> {
+    match GS_IP.load(Ordering::Relaxed) {
+        0 => None,
+        bits => Some(Ipv4Address::from_bits(bits)),
+    }
+}
+
+/// Whether an uplink datagram from `from` may reach the flight controller:
+/// yes if `from` is the ground station, becoming it first if none is known
+/// yet or the current one has been silent for `GS_HANDOVER`. Called only
+/// from thread-mode tasks, which never preempt one another, so the
+/// read-then-write below cannot interleave.
+fn accept_uplink(from: IpEndpoint) -> bool {
+    #[allow(irrefutable_let_patterns)] // IPv4-only build
+    let IpAddress::Ipv4(ip) = from.addr else {
+        return false;
+    };
+    let now = now_ms();
+    let current = GS_IP.load(Ordering::Relaxed);
+    if ip.to_bits() != current {
+        let silent_ms = now.wrapping_sub(GS_LAST_HEARD_MS.load(Ordering::Relaxed));
+        if current != 0 && silent_ms < GS_HANDOVER.as_millis() as u32 {
+            inc(&STATS.uplink_foreign_drops);
+            return false; // the owner is still active
+        }
+        GS_IP.store(ip.to_bits(), Ordering::Relaxed);
+        info!("Ground station: {} (learned from its uplink traffic)", ip);
+    }
+    GS_LAST_HEARD_MS.store(now, Ordering::Relaxed);
+    true
+}
+
+/// Tell a rejected sender which ground station owns this bridge, on its
+/// downlink port (where cybgcs listens). Rate-limited to one notice per
+/// `BUSY_NOTICE_PERIOD`, so the reply traffic stays negligible.
+async fn send_busy_notice(socket: &UdpSocket<'_>, to: IpEndpoint) {
+    let Some(owner) = ground_station() else { return };
+    let now = now_ms();
+    if BUSY_SENT.load(Ordering::Relaxed)
+        && now.wrapping_sub(BUSY_LAST_MS.load(Ordering::Relaxed))
+            < BUSY_NOTICE_PERIOD.as_millis() as u32
+    {
+        return;
+    }
+    BUSY_SENT.store(true, Ordering::Relaxed);
+    BUSY_LAST_MS.store(now, Ordering::Relaxed);
+    warn!("Uplink from {} dropped: this bridge's ground station is {}", to.addr, owner);
+    let notice = udp_batch::busy_notice(owner.octets());
+    let _ = socket.send_to(&notice, (to.addr, DOWNLINK_PORT)).await;
+}
+
+// ---------------------------------------------------------------------------
 // LED status — shared state between tasks
 // ---------------------------------------------------------------------------
 
-/// Bridge status for LED indicator.
-const STATUS_BOOTING: u8 = 0;
-const STATUS_WIFI_CONNECTING: u8 = 1;
-const STATUS_WIFI_CONNECTED: u8 = 2;
-const STATUS_WIFI_DISCONNECTED: u8 = 3;
+/// Bridge status for the LED, stored as `LinkStatus as u8`.
+static BRIDGE_STATUS: AtomicU8 = AtomicU8::new(LinkStatus::Booting as u8);
 
-static BRIDGE_STATUS: AtomicU8 = AtomicU8::new(STATUS_BOOTING);
+fn set_status(status: LinkStatus) {
+    BRIDGE_STATUS.store(status as u8, Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // NTP time state — shared between SNTP task and uplink task
@@ -281,7 +369,7 @@ fn get_ntp_time_us() -> Option<i64> {
 const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
 /// Minimal SNTP query: returns server UTC in microseconds since UNIX epoch.
-async fn sntp_query(stack: Stack<'static>) -> Option<i64> {
+async fn sntp_query(stack: Stack<'static>, server: Ipv4Address) -> Option<i64> {
     let mut rx_meta = [PacketMetadata::EMPTY; 1];
     let mut tx_meta = [PacketMetadata::EMPTY; 1];
     let mut rx_buf = [0u8; 64];
@@ -293,7 +381,7 @@ async fn sntp_query(stack: Stack<'static>) -> Option<i64> {
     let mut request = [0u8; 48];
     request[0] = 0x23;
     socket
-        .send_to(&request, (GROUND_STATION_IP, 123))
+        .send_to(&request, (server, 123))
         .await
         .ok()?;
 
@@ -405,92 +493,16 @@ impl FrameAccumulator {
 }
 
 // ---------------------------------------------------------------------------
-// LED status task — WS2812 on GPIO8
+// LED status task — each board renders the status its own way
 // ---------------------------------------------------------------------------
 
-/// LED patterns (Waveshare WS2812 RGB):
-///   Booting:           breathing blue
-///   WiFi connecting:   breathing blue
-///   WiFi connected:    solid green (dim)
-///   WiFi disconnected: blinking red
-#[cfg(feature = "board-waveshare")]
 #[embassy_executor::task]
-async fn led_task(mut led: SmartLedsAdapter<'static, LED_RMT_BUFFER_SIZE>) {
+async fn led_task(mut led: board::StatusLed) {
     let mut tick: u8 = 0;
     loop {
-        let status = BRIDGE_STATUS.load(Ordering::Relaxed);
-        // ESP32-C6-Zero onboard LED uses RGB wire order (not GRB).
-        // SmartLedsAdapter sends Grb fields [g, r, b] in memory order,
-        // so we put our intended R into the g field, G into r field.
-        let color = match status {
-            STATUS_BOOTING => {
-                // Pulsing blue
-                let v = triangle_wave(tick, 40);
-                rgb::Grb { g: 0, r: 0, b: v }
-            }
-            STATUS_WIFI_CONNECTING => {
-                // Breathing blue
-                let v = triangle_wave(tick, 30);
-                rgb::Grb { g: 0, r: 0, b: v }
-            }
-            STATUS_WIFI_CONNECTED => {
-                // Solid green, dim — put green value in r field (2nd byte = G on wire)
-                rgb::Grb { g: 0, r: 15, b: 0 }
-            }
-            STATUS_WIFI_DISCONNECTED => {
-                // Blinking red — put red value in g field (1st byte = R on wire)
-                let on = (tick / 5) % 2 == 0;
-                if on { rgb::Grb { g: 40, r: 0, b: 0 } } else { rgb::Grb { g: 0, r: 0, b: 0 } }
-            }
-            _ => rgb::Grb { g: 0, r: 0, b: 0 },
-        };
-
-        let _ = led.write([color].into_iter());
+        led.show(LinkStatus::from_u8(BRIDGE_STATUS.load(Ordering::Relaxed)), tick);
         tick = tick.wrapping_add(1);
-        Timer::after_millis(50).await;
-    }
-}
-
-/// Triangle wave: ramps 0→max→0 over `period` ticks.
-#[cfg(feature = "board-waveshare")]
-fn triangle_wave(tick: u8, max_brightness: u8) -> u8 {
-    // period = 2 * 50 ticks = 100 ticks = 5 seconds full cycle at 50ms
-    let phase = tick % 100;
-    let ramp = if phase < 50 { phase } else { 100 - phase };
-    ((ramp as u16 * max_brightness as u16) / 50) as u8
-}
-
-/// Logical "on" level for the XIAO ESP32-C6 user LED (GPIO15). The onboard
-/// LED is active-low (driving the pin LOW lights it). Flip this single const
-/// if a board revision wires it active-high.
-#[cfg(feature = "board-xiao-c6")]
-const LED_ON: Level = Level::Low;
-#[cfg(feature = "board-xiao-c6")]
-const LED_OFF: Level = Level::High;
-
-/// LED patterns (XIAO single monochrome LED on GPIO15 — status conveyed via
-/// blink rate since there is no color):
-///   Booting / WiFi connecting: slow breathe-style blink (~1 Hz)
-///   WiFi connected:            solid on
-///   WiFi disconnected:         fast blink (~5 Hz)
-#[cfg(feature = "board-xiao-c6")]
-#[embassy_executor::task]
-async fn led_task(mut led: Output<'static>) {
-    let mut tick: u8 = 0;
-    loop {
-        let status = BRIDGE_STATUS.load(Ordering::Relaxed);
-        let on = match status {
-            // Slow blink: on for half of a ~1s (20-tick) period.
-            STATUS_BOOTING | STATUS_WIFI_CONNECTING => (tick / 10) % 2 == 0,
-            // Solid on while linked.
-            STATUS_WIFI_CONNECTED => true,
-            // Fast blink (~5 Hz): toggle every 2 ticks (100ms).
-            STATUS_WIFI_DISCONNECTED => (tick / 2) % 2 == 0,
-            _ => false,
-        };
-        led.set_level(if on { LED_ON } else { LED_OFF });
-        tick = tick.wrapping_add(1);
-        Timer::after_millis(50).await;
+        Timer::after_millis(board::LED_TICK_MS).await;
     }
 }
 
@@ -507,7 +519,7 @@ async fn wifi_task(mut controller: WifiController<'static>) {
                 .with_password(WIFI_PASSWORD.to_string());
             let config = ModeConfig::Client(client_config);
             controller.set_config(&config).unwrap();
-            BRIDGE_STATUS.store(STATUS_WIFI_CONNECTING, Ordering::Relaxed);
+            set_status(LinkStatus::WifiConnecting);
             info!("WiFi: starting STA...");
             controller.start_async().await.unwrap();
         }
@@ -516,11 +528,11 @@ async fn wifi_task(mut controller: WifiController<'static>) {
         match controller.connect_async().await {
             Ok(()) => {
                 info!("WiFi: connected");
-                BRIDGE_STATUS.store(STATUS_WIFI_CONNECTED, Ordering::Relaxed);
+                set_status(LinkStatus::WifiConnected);
             }
             Err(e) => {
                 warn!("WiFi: connect failed: {:?}", e);
-                BRIDGE_STATUS.store(STATUS_WIFI_CONNECTING, Ordering::Relaxed);
+                set_status(LinkStatus::WifiConnecting);
                 Timer::after_millis(3000).await;
                 continue;
             }
@@ -529,7 +541,7 @@ async fn wifi_task(mut controller: WifiController<'static>) {
         // Stay here while connected; when we drop out, loop reconnects.
         controller.wait_for_event(WifiEvent::StaDisconnected).await;
         warn!("WiFi: disconnected, will reconnect...");
-        BRIDGE_STATUS.store(STATUS_WIFI_DISCONNECTED, Ordering::Relaxed);
+        set_status(LinkStatus::WifiDisconnected);
         Timer::after_millis(1000).await;
     }
 }
@@ -560,7 +572,13 @@ async fn sntp_task(stack: Stack<'static>) {
     info!("SNTP: network ready, starting sync");
 
     loop {
-        match sntp_query(stack).await {
+        // The NTP server is the ground station; nothing to ask until it has
+        // been heard from.
+        let Some(server) = ground_station() else {
+            Timer::after_secs(1).await;
+            continue;
+        };
+        match sntp_query(stack, server).await {
             Some(ntp_us) => {
                 let now_us = embassy_time::Instant::now().as_micros() as i64;
                 set_ntp_sync(ntp_us, now_us);
@@ -575,32 +593,32 @@ async fn sntp_task(stack: Stack<'static>) {
 }
 
 // ---------------------------------------------------------------------------
-// Downlink stage 1 (interrupt executor, SWI2): UART0 RX → decoded frames
+// Downlink stage 1 (interrupt executor, SWI2): STM32 link RX → decoded frames
 // ---------------------------------------------------------------------------
 
 /// Takes the Blocking RX half — the Async driver types are `!Send`, and an
 /// interrupt executor only accepts `Send` spawns — and converts it here, on
 /// the executor that will own it for good.
 #[embassy_executor::task]
-async fn drain_prio_bootstrap(rx: UartRx<'static, Blocking>) {
+async fn fc_drain_bootstrap(rx: UartRx<'static, Blocking>) {
     // SAFETY: awaited directly in a task body, so the `Context` is the one
     // the Embassy (interrupt) executor created — the documented requirement.
     // Obtaining an `InterruptExecutor`'s `Spawner` is this API's intended use.
     let spawner = unsafe { Spawner::for_current_executor() }.await;
-    spawner.spawn(uart0_rx_drain_task(rx.into_async())).unwrap();
+    spawner.spawn(fc_rx_drain_task(rx.into_async())).unwrap();
 }
 
 /// Drains the STM32 link as fast as bytes arrive and queues whole decoded
 /// frames. Never touches the network, never sleeps, never logs — so WiFi
 /// back-pressure can no longer overrun the UART FIFO.
 #[embassy_executor::task]
-async fn uart0_rx_drain_task(mut rx: UartRx<'static, Async>) {
+async fn fc_rx_drain_task(mut rx: UartRx<'static, Async>) {
     let mut acc = FrameAccumulator::new();
     let mut buf = [0u8; 128];
     loop {
         match rx.read_async(&mut buf).await {
             Ok(n) => {
-                STATS.uart0_rx_bytes.fetch_add(n as u32, Ordering::Relaxed);
+                STATS.fc_rx_bytes.fetch_add(n as u32, Ordering::Relaxed);
                 for &b in &buf[..n] {
                     match acc.feed(b) {
                         Feed::None => {}
@@ -612,7 +630,7 @@ async fn uart0_rx_drain_task(mut rx: UartRx<'static, Async>) {
                 }
                 // A read shorter than the FIFO threshold was woken by the RX
                 // idle timeout (~10 symbol times): the STM32's burst is over.
-                if n < UART0_RX_FIFO_THRESHOLD as usize && acc.at_boundary() {
+                if n < FC_RX_FIFO_THRESHOLD as usize && acc.at_boundary() {
                     dl_push_burst_end();
                 }
             }
@@ -620,7 +638,7 @@ async fn uart0_rx_drain_task(mut rx: UartRx<'static, Async>) {
                 // FIFO overflow / framing / parity. The driver has reset the
                 // FIFO; resynchronise on the next delimiter. No sleep: the
                 // next burst is already on its way.
-                inc(&STATS.uart0_rx_errors);
+                inc(&STATS.fc_rx_errors);
                 acc.reset();
                 dl_push_burst_end();
             }
@@ -675,13 +693,21 @@ async fn downlink_task(stack: Stack<'static>) {
     let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
     socket.bind(0).unwrap(); // ephemeral local port
 
-    // Anything queued before the network came up is stale.
+    // Telemetry has nowhere to go until the ground station has been heard
+    // from; meanwhile the drain discards it (DL_ACTIVE is still false).
+    if ground_station().is_none() {
+        info!("Downlink: waiting to hear from the ground station (is cybgcs running?)");
+        while ground_station().is_none() {
+            Timer::after_millis(100).await;
+        }
+    }
+
+    // Anything queued before now is stale.
     DL_QUEUE.clear();
     DL_ACTIVE.store(true, Ordering::Relaxed);
     info!(
-        "Downlink: {} → {}:{}",
+        "Downlink: {} → ground station :{}",
         if DOWNLINK_BATCHING { "batched" } else { "one frame per datagram" },
-        GROUND_STATION_IP,
         DOWNLINK_PORT
     );
 
@@ -720,7 +746,9 @@ async fn downlink_task(stack: Stack<'static>) {
 
 /// Send one datagram to the ground station. Errors are counted, never slept on.
 async fn send_datagram(socket: &UdpSocket<'_>, bytes: &[u8], frames: usize) {
-    match socket.send_to(bytes, (GROUND_STATION_IP, DOWNLINK_PORT)).await {
+    // Always known here: the downlink starts only once it has been heard from.
+    let Some(gs) = ground_station() else { return };
+    match socket.send_to(bytes, (gs, DOWNLINK_PORT)).await {
         Ok(()) => {
             inc(&STATS.dl_datagrams);
             STATS.dl_frames_sent.fetch_add(frames as u32, Ordering::Relaxed);
@@ -770,7 +798,7 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
     let mut rx_meta = [PacketMetadata::EMPTY; 8];
     let mut tx_meta = [PacketMetadata::EMPTY; 1];
     let mut rx_buf = [0u8; 512];
-    let mut tx_buf = [0u8; 1];
+    let mut tx_buf = [0u8; NOTICE_TX_BUF];
     let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
     socket.bind(UPLINK_PORT).unwrap();
     info!("Uplink: listening on UDP :{}", UPLINK_PORT);
@@ -790,7 +818,11 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
         )
         .await
         {
-            Either::First(Ok((n, _remote))) => {
+            Either::First(Ok((n, meta))) => {
+                if !accept_uplink(meta.endpoint) {
+                    send_busy_notice(&socket, meta.endpoint).await;
+                    continue;
+                }
                 // Normal uplink: COBS-encode the raw datagram and forward to UART.
                 let encoded_len = cobs::encode(&recv_buf[..n], &mut cobs_buf);
                 cobs_buf[encoded_len] = 0x00;
@@ -835,7 +867,7 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
 }
 
 // ---------------------------------------------------------------------------
-// RTCM uplink: UDP RX from ground station → raw UART1 TX → GNSS receiver
+// RTCM uplink: UDP RX from ground station → raw GNSS UART TX → GNSS receiver
 // ---------------------------------------------------------------------------
 //
 // RTK corrections from cybgcs (NTRIP client or local base) land here. Bytes
@@ -845,7 +877,7 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
 // exactly one correction message and never a torn one.
 //
 // The receive loop does nothing but move datagrams into `RTCM_PIPE`, so the
-// socket is drained even while UART1 spends ~89 ms shifting out a 1 KB MSM7
+// socket is drained even while the GNSS UART spends ~89 ms shifting out a 1 KB MSM7
 // frame at 115200 baud; the UART side runs on the highest-priority executor.
 
 #[embassy_executor::task]
@@ -855,7 +887,7 @@ async fn rtcm_uplink_task(stack: Stack<'static>) {
     let mut rx_meta = [PacketMetadata::EMPTY; RTCM_SOCK_RX_META];
     let mut tx_meta = [PacketMetadata::EMPTY; 1];
     let mut rx_buf = [0u8; RTCM_SOCK_RX_BUF];
-    let mut tx_buf = [0u8; 1];
+    let mut tx_buf = [0u8; NOTICE_TX_BUF];
     let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
     socket.bind(RTCM_UPLINK_PORT).unwrap();
     info!("RTCM uplink: listening on UDP :{}", RTCM_UPLINK_PORT);
@@ -863,7 +895,11 @@ async fn rtcm_uplink_task(stack: Stack<'static>) {
     let mut recv_buf = [0u8; 1500];
     loop {
         match socket.recv_from(&mut recv_buf).await {
-            Ok((n, _)) => {
+            Ok((n, meta)) => {
+                if !accept_uplink(meta.endpoint) {
+                    send_busy_notice(&socket, meta.endpoint).await;
+                    continue;
+                }
                 inc(&STATS.rtcm_rx_dgrams);
                 STATS.rtcm_rx_bytes.fetch_add(n as u32, Ordering::Relaxed);
                 if !rtcm_enqueue(&recv_buf[..n]) {
@@ -894,7 +930,7 @@ fn rtcm_enqueue(d: &[u8]) -> bool {
     true
 }
 
-/// Takes the Blocking UART1 TX half (see `drain_prio_bootstrap`).
+/// Takes the Blocking GNSS UART TX half (see `fc_drain_bootstrap`).
 #[embassy_executor::task]
 async fn rtcm_prio_bootstrap(tx: UartTx<'static, Blocking>) {
     // SAFETY: awaited directly in a task body, so the `Context` is the one
@@ -904,7 +940,7 @@ async fn rtcm_prio_bootstrap(tx: UartTx<'static, Blocking>) {
     spawner.spawn(rtcm_uart_writer_task(tx.into_async())).unwrap();
 }
 
-/// Keeps UART1 saturated from `RTCM_PIPE`, on the highest-priority executor,
+/// Keeps the GNSS UART saturated from `RTCM_PIPE`, on the highest-priority executor,
 /// so no WiFi or telemetry work ever delays a correction on its way out.
 #[embassy_executor::task]
 async fn rtcm_uart_writer_task(mut tx: UartTx<'static, Async>) {
@@ -928,10 +964,11 @@ async fn stats_task() {
         ticker.next().await;
         let g = |c: &AtomicU32| c.load(Ordering::Relaxed);
         info!(
-            "stats: uart0 err {} rx {}B | dl frames {} dgrams {} qdrop {} cobs {} send_err {} qhwm {} \
-             | rtcm rx {} ({}B) drop {} err {} pipe_hwm {}B uart {}B | heap free {}B",
-            g(&STATS.uart0_rx_errors),
-            g(&STATS.uart0_rx_bytes),
+            "stats: fc err {} rx {}B | dl frames {} dgrams {} qdrop {} cobs {} send_err {} qhwm {} \
+             | rtcm rx {} ({}B) drop {} err {} pipe_hwm {}B uart {}B | foreign uplink {} \
+             | heap free {}B",
+            g(&STATS.fc_rx_errors),
+            g(&STATS.fc_rx_bytes),
             g(&STATS.dl_frames_sent),
             g(&STATS.dl_datagrams),
             g(&STATS.dl_queue_drops),
@@ -944,6 +981,7 @@ async fn stats_task() {
             g(&STATS.rtcm_recv_errors),
             STATS.rtcm_pipe_hwm.swap(0, Ordering::Relaxed),
             g(&STATS.rtcm_uart_bytes),
+            g(&STATS.uplink_foreign_drops),
             esp_alloc::HEAP.free(),
         );
     }
@@ -968,76 +1006,48 @@ async fn main(spawner: Spawner) -> ! {
     // enlarged WiFi RX queue (each held frame pins a buffer).
     esp_alloc::heap_allocator!(size: 96_000);
 
-    // 4. Start esp-rtos scheduler (must happen before esp_radio::init).
-    let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
-    let sw_ints =
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    // 4. Board: claims its UARTs and pins, sets up the status LED and antenna
+    // (before WiFi init), and returns what the application needs. The UART
+    // halves stay Blocking until their tasks convert them on their own
+    // executors. The board picks the UARTs and pins; the settings are ours.
+    let board::Board { fc_rx, fc_tx, gnss_tx, led, wifi, timg0, sw_interrupt } = board::init(
+        peripherals,
+        board::LinkConfig {
+            fc_uart: uart::Config::default()
+                .with_baudrate(FC_UART_BAUD)
+                .with_rx(RxConfig::default().with_fifo_full_threshold(FC_RX_FIFO_THRESHOLD)),
+            gnss_uart: uart::Config::default().with_baudrate(GNSS_UART_BAUD),
+        },
+    );
+    info!("cybesp-bridge: board {}, STM32 link {} baud", board::NAME, FC_UART_BAUD);
+    match gnss_tx {
+        Some(_) => info!("cybesp-bridge: GNSS UART {} baud (RTCM3 → receiver)", GNSS_UART_BAUD),
+        None => warn!("cybesp-bridge: this board has no GNSS UART; RTCM corrections disabled"),
+    }
+
+    // 5. Start esp-rtos scheduler (must happen before esp_radio::init).
+    let timg0 = esp_hal::timer::timg::TimerGroup::new(timg0);
+    let sw_ints = esp_hal::interrupt::software::SoftwareInterruptControl::new(sw_interrupt);
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
 
-    // 5. Init status LED.
-    #[cfg(feature = "board-waveshare")]
-    {
-        // WS2812 RGB LED on GPIO8 via RMT channel 0.
-        let rmt = Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80)).unwrap();
-        static LED_BUF: StaticCell<[PulseCode; LED_RMT_BUFFER_SIZE]> = StaticCell::new();
-        let rmt_buf = LED_BUF.init([PulseCode::default(); LED_RMT_BUFFER_SIZE]);
-        let led = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO8, rmt_buf);
-        spawner.spawn(led_task(led)).unwrap();
-    }
-    #[cfg(feature = "board-xiao-c6")]
-    {
-        // Single monochrome user LED on GPIO15.
-        let led = Output::new(peripherals.GPIO15, LED_OFF, OutputConfig::default());
-        spawner.spawn(led_task(led)).unwrap();
-    }
+    spawner.spawn(led_task(led)).unwrap();
 
-    // 6. Init UART0 for STM32 communication (921600 baud, 8N1). The RX half
-    // stays Blocking until the drain task converts it on its own executor.
-    let uart_config = esp_hal::uart::Config::default()
-        .with_baudrate(921_600)
-        .with_rx(RxConfig::default().with_fifo_full_threshold(UART0_RX_FIFO_THRESHOLD));
-    let (uart_rx, uart_tx) = esp_hal::uart::Uart::new(peripherals.UART0, uart_config)
-        .unwrap()
-        .with_tx(peripherals.GPIO16)
-        .with_rx(peripherals.GPIO17)
-        .split();
-    let uart_tx = uart_tx.into_async();
-
-    info!("cybesp-bridge: UART0 init OK (921600 baud)");
-
-    // 6a. Init UART1 for RTCM3 forwarding to ublox UART2 (115200 baud, TX-only).
-    // The ublox doesn't talk back on UART2, so we don't bind an RX pin.
-    // Pin: GPIO14 on Waveshare; GPIO0 on XIAO (GPIO14 is the antenna switch there).
-    let rtcm_uart_config = esp_hal::uart::Config::default().with_baudrate(115_200);
-    let rtcm_uart_builder = esp_hal::uart::Uart::new(peripherals.UART1, rtcm_uart_config).unwrap();
-    #[cfg(feature = "board-waveshare")]
-    let rtcm_uart = rtcm_uart_builder.with_tx(peripherals.GPIO14);
-    #[cfg(feature = "board-xiao-c6")]
-    let rtcm_uart = rtcm_uart_builder.with_tx(peripherals.GPIO0);
-    let (_, rtcm_uart_tx) = rtcm_uart.split(); // Blocking; converted by its task
-
-    info!("cybesp-bridge: UART1 init OK (115200 baud, RTCM3 → GNSS receiver)");
-
-    // 6b. High-priority executors for the two UART data paths. SWI0 belongs to
+    // 6. High-priority executors for the two UART data paths. SWI0 belongs to
     // the esp-rtos scheduler.
-    let rtcm_exec = mk_static!(
-        InterruptExecutor<1>,
-        InterruptExecutor::new(sw_ints.software_interrupt1)
-    );
-    rtcm_exec.start(RTCM_PRIO).spawn(rtcm_prio_bootstrap(rtcm_uart_tx)).unwrap();
+    let has_gnss = gnss_tx.is_some();
+    if let Some(gnss_tx) = gnss_tx {
+        let rtcm_exec = mk_static!(
+            InterruptExecutor<1>,
+            InterruptExecutor::new(sw_ints.software_interrupt1)
+        );
+        rtcm_exec.start(RTCM_PRIO).spawn(rtcm_prio_bootstrap(gnss_tx)).unwrap();
+    }
     let drain_exec = mk_static!(
         InterruptExecutor<2>,
         InterruptExecutor::new(sw_ints.software_interrupt2)
     );
-    drain_exec.start(DRAIN_PRIO).spawn(drain_prio_bootstrap(uart_rx)).unwrap();
-
-    // 6c. XIAO ESP32-C6 antenna switch: enable the RF switch (GPIO3 LOW) and
-    // select the built-in PCB antenna (GPIO14 LOW). Named bindings keep the
-    // pins driven for the program lifetime (main never returns).
-    #[cfg(feature = "board-xiao-c6")]
-    let _rf_enable = Output::new(peripherals.GPIO3, Level::Low, OutputConfig::default());
-    #[cfg(feature = "board-xiao-c6")]
-    let _ant_select = Output::new(peripherals.GPIO14, Level::Low, OutputConfig::default());
+    drain_exec.start(DRAIN_PRIO).spawn(fc_drain_bootstrap(fc_rx)).unwrap();
+    let fc_tx = fc_tx.into_async();
 
     // 7. Init WiFi radio.
     let radio_init = &*mk_static!(
@@ -1053,7 +1063,7 @@ async fn main(spawner: Spawner) -> ! {
         .with_rx_queue_size(WIFI_RX_QUEUE)
         .with_tx_queue_size(WIFI_TX_QUEUE);
     let (controller, interfaces) =
-        esp_radio::wifi::new(radio_init, peripherals.WIFI, wifi_config).unwrap();
+        esp_radio::wifi::new(radio_init, wifi, wifi_config).unwrap();
     let sta_interface = interfaces.sta;
 
     // 9. Configure embassy-net with DHCP.
@@ -1074,9 +1084,11 @@ async fn main(spawner: Spawner) -> ! {
     // 10. Spawn tasks.
     spawner.spawn(wifi_task(controller)).unwrap();
     spawner.spawn(net_task(runner)).unwrap();
-    spawner.spawn(rtcm_uplink_task(stack)).unwrap();
+    if has_gnss {
+        spawner.spawn(rtcm_uplink_task(stack)).unwrap();
+    }
     spawner.spawn(downlink_task(stack)).unwrap();
-    spawner.spawn(uplink_task(uart_tx, stack)).unwrap();
+    spawner.spawn(uplink_task(fc_tx, stack)).unwrap();
     spawner.spawn(sntp_task(stack)).unwrap();
     spawner.spawn(stats_task()).unwrap();
 

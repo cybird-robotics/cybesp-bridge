@@ -12,8 +12,16 @@ env:
 
 jobs:
   build:
-    name: Build
+    name: Build (${{ matrix.features }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every board, and every board option, so none can break unnoticed.
+        features:
+          - board-waveshare
+          - board-xiao-c6
+          - board-xiao-c6,ext-antenna
 
     steps:
       - uses: actions/checkout@v4
@@ -39,7 +47,7 @@ jobs:
 
       - name: Build
         run:
-          cargo build
+          cargo build --no-default-features --features ${{ matrix.features }}
 
   publish:
     name: Publish Crate
