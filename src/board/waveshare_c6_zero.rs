@@ -6,24 +6,25 @@
 //! | GNSS receiver (RTCM3 in) | UART1 | TX GPIO14 |
 //! | Status LED | RMT ch 0 | GPIO8 (WS2812, RGB wire order) |
 
-#[cfg(feature = "ext-antenna")]
-compile_error!("ext-antenna: the Waveshare ESP32-C6-Zero has no external antenna connector");
-
-use esp_hal::peripherals::Peripherals;
+use esp_hal::peripherals::{FLASH, Peripherals};
 use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::uart::Uart;
 use esp_hal_smartled::SmartLedsAdapter;
 use smart_leds::SmartLedsWrite;
 use static_cell::StaticCell;
 
-use super::{Board, LinkConfig, LinkStatus};
+use super::{Board, BoardConfig, LinkStatus};
 
 pub const NAME: &str = "Waveshare ESP32-C6-Zero";
+/// The onboard antenna is the only one: `BoardConfig::ext_antenna` is ignored.
+pub const HAS_ANTENNA_SWITCH: bool = false;
 
 /// RMT buffer size for 1 WS2812 LED (24 bits + 1 reset pulse).
 const LED_RMT_BUFFER_SIZE: usize = 25;
 
-pub fn init(p: Peripherals, cfg: LinkConfig) -> Board {
+pub fn init(p: Peripherals, configure: impl FnOnce(FLASH<'static>) -> BoardConfig) -> Board {
+    let cfg = configure(p.FLASH);
+
     let (fc_rx, fc_tx) = Uart::new(p.UART0, cfg.fc_uart)
         .unwrap()
         .with_tx(p.GPIO16)
@@ -49,6 +50,7 @@ pub fn init(p: Peripherals, cfg: LinkConfig) -> Board {
         wifi: p.WIFI,
         timg0: p.TIMG0,
         sw_interrupt: p.SW_INTERRUPT,
+        usb: p.USB_DEVICE,
     }
 }
 

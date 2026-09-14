@@ -21,7 +21,6 @@ jobs:
         features:
           - board-waveshare
           - board-xiao-c6
-          - board-xiao-c6,ext-antenna
 
     steps:
       - uses: actions/checkout@v4

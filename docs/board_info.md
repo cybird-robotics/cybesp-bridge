@@ -31,25 +31,25 @@ build commands.
 | UART1 TX → ublox (RTCM3) | GPIO0 | D0 | 115200 baud, TX-only (GPIO14 unavailable — antenna switch) |
 | Status LED | GPIO15 | — | single monochrome LED, active-low, blink-rate status |
 | RF switch enable | GPIO3 | — | held LOW |
-| Antenna select | GPIO14 | — | LOW = built-in PCB antenna (default); HIGH = external u.FL with the `ext-antenna` feature |
+| Antenna select | GPIO14 | — | LOW = built-in PCB antenna (default); HIGH = external u.FL with the `ext_antenna` setting |
 
 Key differences from the Waveshare board:
 - No RGB LED — status is shown by blink rate on the single GPIO15 LED.
 - GPIO14 is the antenna switch, so RTCM3 TX moves to GPIO0.
 - WiFi requires explicit antenna setup: GPIO3 LOW, and GPIO14 LOW for the PCB
-  antenna or HIGH for the external one (`ext-antenna`).
+  antenna or HIGH for the external one (`ext_antenna` setting).
 
 ## XIAO antenna selection
 
 The XIAO has an RF switch that routes the radio to either the built-in PCB
 (ceramic) antenna or the external u.FL connector. The firmware sets it once at
-boot, in `init()` in `src/board/xiao_c6.rs`, according to the `ext-antenna`
-Cargo feature:
+boot, in `init()` in `src/board/xiao_c6.rs`, according to the `ext_antenna`
+setting (see the README's Settings section):
 
-| GPIO3 (RF switch enable) | GPIO14 (antenna select) | Antenna used | Features |
-|--------------------------|-------------------------|--------------|----------|
-| LOW | LOW | built-in PCB antenna (**default**) | `board-xiao-c6` |
-| LOW | HIGH | external u.FL antenna | `board-xiao-c6,ext-antenna` |
+| GPIO3 (RF switch enable) | GPIO14 (antenna select) | Antenna used | `ext_antenna` |
+|--------------------------|-------------------------|--------------|---------------|
+| LOW | LOW | built-in PCB antenna (**default**) | `0` |
+| LOW | HIGH | external u.FL antenna | `1` |
 
 **The GPIO14 level must match the hardware.** Selecting the external antenna
 with nothing plugged into the u.FL connector sends the radio into an empty
@@ -62,20 +62,20 @@ while an external one is fitted just ignores the external one.
    plug, and fit it with the board unpowered. u.FL connectors are fragile and
    rated for only a few dozen mating cycles, so press straight down and pull
    by the plug, not the cable.
-2. **Build and flash with the `ext-antenna` feature**, which drives GPIO14
-   HIGH (`ANTENNA_SELECT` in `src/board/xiao_c6.rs`); no code change needed:
-   `cargo run --release --no-default-features --features board-xiao-c6,ext-antenna`
-   The boot log then names the board "Seeed XIAO ESP32-C6 (external antenna)".
+2. **Select it in the settings** over USB: `param set ext_antenna 1`,
+   `param save`, `reboot`. No rebuild is needed; the boot log then shows
+   `ext_antenna = 1`.
 3. **Check the link before flight.** Compare the link on the bench and at the
    distance you will fly: the status LED staying solid, and `cybgcs` showing
    steady downlink with no rising drop counters. If the link is worse than
    with the built-in antenna, check that the plug is seated and that the boot
-   log shows the external-antenna build.
-4. **Label the board** (for example "EXT ANT") so it isn't later flashed with
-   a build that selects the built-in antenna, or vice versa.
+   log shows `ext_antenna = 1`.
+4. **Label the board** (for example "EXT ANT") so nobody later resets its
+   settings to the built-in antenna, or sets `ext_antenna 1` on a board
+   without one.
 
 The Waveshare ESP32-C6-Zero has only its onboard antenna and no switch, so
-none of this applies to it; `ext-antenna` is a compile error there.
+none of this applies to it; it refuses `param set ext_antenna 1`.
 
 
 # Adding a board
@@ -84,16 +84,19 @@ Everything board-specific lives in one file under `src/board/`; the
 application code in `src/bin/main.rs` doesn't change.
 
 1. **Create `src/board/<board>.rs`**, starting from the closest existing
-   board file. It provides `NAME`, `init(Peripherals, LinkConfig) -> Board`
-   and `StatusLed::show(LinkStatus, tick)`. `init` picks the UART instance and
-   pins for the STM32 link and for the GNSS UART; the baud rates and FIFO
-   settings arrive in `LinkConfig`, so use them as given. Return
-   `gnss_tx: None` if the board has no UART or pin to spare for RTCM.
+   board file. It provides `NAME`, `HAS_ANTENNA_SWITCH`,
+   `init(Peripherals, configure) -> Board` and
+   `StatusLed::show(LinkStatus, tick)`. `init` first passes `p.FLASH` to
+   `configure`, which loads the settings and returns the `BoardConfig`; then
+   it picks the UART instance and pins for the STM32 link and for the GNSS
+   UART, using the baud rates and FIFO settings from `BoardConfig` as given.
+   Return `gnss_tx: None` if the board has no UART or pin to spare for RTCM,
+   and hand back `p.USB_DEVICE` for the settings shell.
 2. **Add its feature** in `Cargo.toml` (`board-<name> = [...]`, with any
    board-only dependencies as `dep:`), and a matching `#[cfg_attr(feature =
    ..., path = ...)]` line in `src/board/mod.rs`. `build.rs` needs no change.
-3. **Reject options the board can't support** with a `compile_error!` in the
-   board file, as `waveshare_c6_zero.rs` does for `ext-antenna`.
+3. **Declare what the board lacks**: with `HAS_ANTENNA_SWITCH = false`, as in
+   `waveshare_c6_zero.rs`, the settings refuse `ext_antenna`.
 4. **Add it to the CI matrix** in `.github/workflows/rust.yml`.
 5. **Document it:** a section in this file with its pin table and quirks, and
    a column in the README hardware table.

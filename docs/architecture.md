@@ -43,9 +43,10 @@ learns the ground station's IP from the ground station's own traffic; see
 | **Time sync (SNTP)** | UDP NTP query → GS NTP server | NTP wire format | → GS :123 |
 | **Time sync (PTP follow-up)** | UART0 TX every 3 s | COBS, msg_id 129 | — |
 
-Key constants live at the top of `src/bin/main.rs`: `WIFI_SSID`,
-`WIFI_PASSWORD`, `DOWNLINK_PORT` (4210), `UPLINK_PORT` (4211),
-`RTCM_UPLINK_PORT` (4212).
+Key constants live at the top of `src/bin/main.rs`: `DOWNLINK_PORT` (4210),
+`UPLINK_PORT` (4211), `RTCM_UPLINK_PORT` (4212). WiFi credentials, the baud
+rates and the antenna are settings; see
+[Settings and USB shell](#settings-and-usb-shell).
 
 ### Ground station discovery and uplink lock
 
@@ -58,7 +59,7 @@ until then the downlink discards telemetry and SNTP waits.
 
 The bridge then belongs to that ground station. Datagrams to :4211 or :4212
 from any other sender are dropped before the flight controller sees them, and
-counted (`uplink_foreign_drops`, in the stats log). The firmware ignores
+counted (`uplink_foreign_drops`, shown by the shell's `stats`). The firmware ignores
 sequence numbers, so it can't tell two ground stations' fleet states, Vicon
 poses, origins or RTCM streams apart; without the lock, a second `cybgcs`
 would interleave its own with the first one's. The rejected sender gets a busy
@@ -84,9 +85,11 @@ peripherals then spawns independent Embassy tasks; the main task idles.
 1. ESP-HAL init at max CPU clock.
 2. Logger init (`esp-println`, USB-Serial-JTAG **only** — see below).
 3. Heap allocator (96 KB — the WiFi stack, sized for its enlarged RX queue).
-4. `board::init`: the board claims its UARTs and pins (STM32 link at 921600,
-   RX FIFO threshold 32; GNSS UART at 115200, TX-only), sets up its status LED
-   and antenna, and returns the rest. The UART halves stay Blocking here.
+4. `board::init`: the board first hands over the flash peripheral, from which
+   the settings are loaded (`settings::Store::open`); then it claims its UARTs
+   and pins at the configured baud rates (STM32 link RX FIFO threshold 32;
+   GNSS UART TX-only), sets up its status LED and antenna, and returns the
+   rest. The UART halves stay Blocking here.
 5. Start the esp-rtos scheduler (TIMG0 + software interrupt); spawn `led_task`.
 6. Start the interrupt executors: SWI1 → RTCM writer (only if the board has a
    GNSS UART), SWI2 → STM32 link drain.
@@ -123,7 +126,8 @@ small bootstrap task that converts it with `into_async()` in place.
 | `wifi_task` | thread | STA connect + auto-reconnect; drives `BRIDGE_STATUS`. |
 | `net_task` | thread | Runs the `embassy-net` stack. |
 | `sntp_task` | thread | Polls the GS NTP server every 3 s; stores sync point in `NTP_STATE`. |
-| `stats_task` | thread | Logs the `STATS` counters every 5 s. |
+| `stats_task` | thread | Logs the `STATS` counters every 5 s, only after `stats on` in the shell (off at boot). |
+| `shell_task` | thread | USB settings shell (`param …`, `reboot`); see [Settings and USB shell](#settings-and-usb-shell). |
 | `led_task` | thread | Passes `BRIDGE_STATUS` to the board's `StatusLed` every 50 ms; the board picks the pattern. |
 
 ### Buffering and loss policy
@@ -151,7 +155,8 @@ frames carry no CRC, and a spliced frame could decode as valid.
   network tasks.
 - `STATS: BridgeStats` — cumulative `AtomicU32` counters: UART0 errors, COBS
   errors, queue drops and high-water marks, datagrams sent, RTCM received /
-  dropped / bytes to UART1. Logged every 5 s; four of them ride in every
+  dropped / bytes to UART1. Shown by the shell's `stats` (and logged every 5 s
+  after `stats on`); four of them ride in every
   downlink batch header, so `cybgcs` shows them per drone without a USB log.
 
 ### Wire protocol (COBS)
@@ -187,6 +192,31 @@ falls back to UART0 whenever no USB host has been attached, and UART0 is the
 STM32 link: every log line would be injected into the flight controller's
 uplink. The default `critical-section` feature is also off, since it masked
 interrupts for each print and would stall the high-priority UART tasks.
+
+Log records are printed by `cybesp_bridge::logger` (`LEVEL - message`, the
+level from `ESP_LOG` at build time) with CR LF line ends, so terminals such as
+minicom show them properly; esp-println's own logger ends lines with a bare LF.
+
+### Settings and USB shell
+
+The WiFi SSID and password, `fc_baud`, `gnss_baud` and `ext_antenna` are
+settings (`src/settings.rs`) with built-in defaults. They are stored in the
+`nvs` flash partition, found through the partition table, as a
+`sequential-storage` map keyed by a fixed id per setting, each value as the
+text `param set` takes. At boot a missing or invalid stored value falls back
+to its default. The board needs the bauds and the antenna while it claims its
+pins, so `board::init` hands the flash peripheral to the application first.
+
+`shell_task` reads lines from the USB-Serial-JTAG port (esp-hal driver,
+receive half only) and prints through `esp_println`, like the logs. The
+driver's transmit half is never used: it would interleave with esp-println's
+direct FIFO writes. Commands: `param list | get | set | save | reset`,
+`reboot`. Settings apply at the next boot.
+
+Every flash write or erase runs with interrupts masked on this single-core
+chip, so `param save` stalls the UART drains, the RTCM writer and WiFi while
+it runs: expect some lost telemetry frames (counted as UART0 errors) and a
+gap in corrections. The store is written only by that command.
 
 ### Time sync (NTP + PTP follow-up)
 
@@ -235,7 +265,7 @@ color fields are remapped — see `led_task`.)
 | UART1 TX → ublox (RTCM3) | GPIO0 | D0 | 115200, TX-only (GPIO14 is the antenna switch) |
 | Status LED (user) | GPIO15 | — | single **monochrome** LED, **active-low**, blink-rate status |
 | RF switch enable | GPIO3 | — | held LOW |
-| Antenna select | GPIO14 | — | LOW = built-in PCB antenna (default); HIGH = external u.FL with the `ext-antenna` feature — must match the fitted hardware, see [board_info.md](board_info.md#xiao-antenna-selection) |
+| Antenna select | GPIO14 | — | LOW = built-in PCB antenna (default); HIGH = external u.FL with the `ext_antenna` setting — must match the fitted hardware, see [board_info.md](board_info.md#xiao-antenna-selection) |
 
 LED patterns (no color → status by blink rate): slow ~1 Hz blink =
 booting/connecting, **solid on = connected**, fast ~5 Hz blink = disconnected.
@@ -264,22 +294,25 @@ enabled.
 Each board file provides the same items:
 
 - `NAME`, logged at boot.
-- `init(Peripherals, LinkConfig) -> Board`: claims the board's UARTs and pins,
-  sets up its LED and antenna, and returns a `Board` holding the STM32 link
-  halves (`fc_rx`, `fc_tx`), the GNSS TX half (`gnss_tx`, `None` on a board
-  with no UART to spare), the `StatusLed`, and the peripherals the application
-  still needs (WiFi, TIMG0, software interrupts).
+- `HAS_ANTENNA_SWITCH`: whether the `ext_antenna` setting applies.
+- `init(Peripherals, configure) -> Board`: first passes the flash peripheral
+  to `configure`, which loads the settings and returns the `BoardConfig`;
+  then claims the board's UARTs and pins, sets up its LED and antenna, and
+  returns a `Board` holding the STM32 link halves (`fc_rx`, `fc_tx`), the
+  GNSS TX half (`gnss_tx`, `None` on a board with no UART to spare), the
+  `StatusLed`, and the peripherals the application still needs (WiFi, TIMG0,
+  software interrupts, the USB port).
 - `StatusLed::show(LinkStatus, tick)`, called by the single `led_task` every
   `board::LED_TICK_MS` (50 ms).
 
 The **board** decides which UART instance and pins carry each link. The
-**application** decides the link settings (`LinkConfig`: baud rates, FIFO
+**application** decides the link settings (`BoardConfig`: baud rates, FIFO
 threshold) and never names a GPIO or UART instance. esp-hal 1.0's UART driver
 types don't depend on the instance or the pins, so every board returns the
 same types and the tasks don't change per board.
 
-Board options are features the board file checks: `ext-antenna` selects the
-XIAO's u.FL connector, and is a compile error on the Waveshare.
+What a board lacks is a constant the settings check: with
+`HAS_ANTENNA_SWITCH = false` (the Waveshare), `ext_antenna` is refused.
 
 The RGB-only deps (`esp-hal-smartled`, `smart-leds`, `rgb`) are **optional** and
 pulled in only by `board-waveshare`, so the XIAO build doesn't compile them.
@@ -298,11 +331,7 @@ Prerequisites: Rust stable with the `riscv32imac-unknown-none-elf` target and
 cargo run --release
 
 # Seeed XIAO ESP32-C6
-cargo run --release --no-default-features --features board-xiao-c6
-
-# Seeed XIAO ESP32-C6 with an external u.FL antenna fitted
-cargo run --release --no-default-features --features board-xiao-c6,ext-antenna
-```
+cargo run --release --no-default-features --features board-xiao-c6```
 
 On the XIAO, if it boots into download mode, power-cycle and run
 `espflash monitor` separately (see the XIAO note above). Log verbosity is set

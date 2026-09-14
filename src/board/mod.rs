@@ -6,9 +6,12 @@
 //! by `build.rs`). Every board file provides the same items:
 //!
 //! - `NAME`: the board's name, logged at boot.
-//! - `init(Peripherals, LinkConfig) -> Board`: claims the board's UARTs and
-//!   pins, applies board-level setup such as the antenna switch, and hands
-//!   back the peripherals the application still needs.
+//! - `HAS_ANTENNA_SWITCH`: whether [`BoardConfig::ext_antenna`] means anything.
+//! - `init(Peripherals, configure) -> Board`: first hands the flash peripheral
+//!   to `configure`, which returns the [`BoardConfig`] (the settings live in
+//!   flash); then claims the board's UARTs and pins, applies board-level setup
+//!   such as the antenna switch, and hands back the peripherals the
+//!   application still needs.
 //! - `StatusLed`, with `show(LinkStatus, tick)` called every [`LED_TICK_MS`].
 //!
 //! The application never names a GPIO or a UART instance; it uses the links
@@ -21,22 +24,25 @@
 #[cfg_attr(feature = "board-xiao-c6", path = "xiao_c6.rs")]
 mod imp;
 
-pub use imp::{NAME, StatusLed, init};
+pub use imp::{HAS_ANTENNA_SWITCH, NAME, StatusLed, init};
 
 use esp_hal::Blocking;
-use esp_hal::peripherals::{SW_INTERRUPT, TIMG0, WIFI};
+use esp_hal::peripherals::{SW_INTERRUPT, TIMG0, USB_DEVICE, WIFI};
 use esp_hal::uart::{self, UartRx, UartTx};
 
 /// Period of `StatusLed::show` calls; LED patterns are counted in these ticks.
 pub const LED_TICK_MS: u64 = 50;
 
-/// Link settings, chosen by the application. A board decides only which UART
-/// and pins carry each link, never its baud rate or FIFO settings.
-pub struct LinkConfig {
+/// Settings chosen by the application. A board decides only which UART and
+/// pins carry each link, never its baud rate or FIFO settings.
+pub struct BoardConfig {
     /// STM32 flight-controller link: bidirectional, COBS framed.
     pub fc_uart: uart::Config,
     /// RTCM3 corrections to the GNSS receiver: TX only, unframed.
     pub gnss_uart: uart::Config,
+    /// Use the external antenna connector. Ignored by a board without an
+    /// antenna switch (the settings refuse it there).
+    pub ext_antenna: bool,
 }
 
 /// What a board hands to the application. The UART halves are Blocking; each
@@ -52,6 +58,8 @@ pub struct Board {
     pub wifi: WIFI<'static>,
     pub timg0: TIMG0<'static>,
     pub sw_interrupt: SW_INTERRUPT<'static>,
+    /// The USB-Serial-JTAG port, for the settings shell.
+    pub usb: USB_DEVICE<'static>,
 }
 
 /// Bridge state shown on the status LED.

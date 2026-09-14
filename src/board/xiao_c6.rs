@@ -7,36 +7,26 @@
 //! | GNSS receiver (RTCM3 in) | UART1 | TX GPIO0 (D0) — GPIO14 is the antenna switch |
 //! | Status LED | — | GPIO15, active-low |
 //! | RF switch enable | — | GPIO3, held LOW |
-//! | Antenna select | — | GPIO14: LOW built-in, HIGH external (`ext-antenna`) |
+//! | Antenna select | — | GPIO14: LOW built-in, HIGH external (`ext_antenna` setting) |
 
 use esp_hal::gpio::{Level, Output, OutputConfig};
-use esp_hal::peripherals::Peripherals;
+use esp_hal::peripherals::{FLASH, Peripherals};
 use esp_hal::uart::Uart;
 use static_cell::StaticCell;
 
-use super::{Board, LinkConfig, LinkStatus};
+use super::{Board, BoardConfig, LinkStatus};
 
-pub const NAME: &str = if cfg!(feature = "ext-antenna") {
-    "Seeed XIAO ESP32-C6 (external antenna)"
-} else {
-    "Seeed XIAO ESP32-C6"
-};
-
-/// GPIO14 level: LOW selects the built-in PCB antenna, HIGH the external u.FL
-/// connector. Selecting external with no antenna fitted leaves a very weak
-/// link — see docs/board_info.md.
-const ANTENNA_SELECT: Level = if cfg!(feature = "ext-antenna") {
-    Level::High
-} else {
-    Level::Low
-};
+pub const NAME: &str = "Seeed XIAO ESP32-C6";
+pub const HAS_ANTENNA_SWITCH: bool = true;
 
 /// The user LED is active-low (driving the pin LOW lights it). Flip these if a
 /// board revision wires it active-high.
 const LED_ON: Level = Level::Low;
 const LED_OFF: Level = Level::High;
 
-pub fn init(p: Peripherals, cfg: LinkConfig) -> Board {
+pub fn init(p: Peripherals, configure: impl FnOnce(FLASH<'static>) -> BoardConfig) -> Board {
+    let cfg = configure(p.FLASH);
+
     let (fc_rx, fc_tx) = Uart::new(p.UART0, cfg.fc_uart)
         .unwrap()
         .with_tx(p.GPIO16)
@@ -49,13 +39,20 @@ pub fn init(p: Peripherals, cfg: LinkConfig) -> Board {
         .with_tx(p.GPIO0)
         .split();
 
-    // Enable the RF switch and select the antenna, before WiFi init. The
-    // drivers live in a static, never dropped, so the pins stay driven for the
-    // program's lifetime whatever esp-hal does on drop.
+    // Enable the RF switch and select the antenna, before WiFi init. GPIO14
+    // LOW selects the built-in PCB antenna, HIGH the external u.FL connector;
+    // external with no antenna fitted leaves a very weak link (see
+    // docs/board_info.md). The drivers live in a static, never dropped, so the
+    // pins stay driven for the program's lifetime whatever esp-hal does on drop.
+    let antenna = if cfg.ext_antenna {
+        Level::High
+    } else {
+        Level::Low
+    };
     static RF_SWITCH: StaticCell<[Output<'static>; 2]> = StaticCell::new();
     RF_SWITCH.init([
         Output::new(p.GPIO3, Level::Low, OutputConfig::default()),
-        Output::new(p.GPIO14, ANTENNA_SELECT, OutputConfig::default()),
+        Output::new(p.GPIO14, antenna, OutputConfig::default()),
     ]);
 
     let led = StatusLed(Output::new(p.GPIO15, LED_OFF, OutputConfig::default()));
@@ -68,6 +65,7 @@ pub fn init(p: Peripherals, cfg: LinkConfig) -> Board {
         wifi: p.WIFI,
         timg0: p.TIMG0,
         sw_interrupt: p.SW_INTERRUPT,
+        usb: p.USB_DEVICE,
     }
 }
 

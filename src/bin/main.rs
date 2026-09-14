@@ -50,15 +50,16 @@ use static_cell::StaticCell;
 
 use cybesp_bridge::board::{self, LinkStatus};
 use cybesp_bridge::mk_static;
+use cybesp_bridge::settings::{self, Password, Ssid};
+use cybesp_bridge::shell;
+use esp_hal::peripherals::USB_DEVICE;
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// WiFi network SSID to join.
-const WIFI_SSID: &str = "UTADR";
-/// WiFi password.
-const WIFI_PASSWORD: &str = "adr2025WIN";
+// WiFi credentials, the link baud rates and the antenna are settings
+// (`cybesp_bridge::settings`), changed from the USB shell: type `help`.
 // The ground station's IP is not configured: the bridge learns it from the
 // ground station's own traffic (see "Ground station discovery").
 
@@ -70,12 +71,6 @@ const UPLINK_PORT: u16 = 4211;
 /// receiver. Datagrams are written verbatim to the GNSS UART — no COBS, no
 /// framing. The receiver parses RTCM3 itself (length + CRC24Q).
 const RTCM_UPLINK_PORT: u16 = 4212;
-
-/// STM32 link baud rate (8N1, no flow control); must match the flight
-/// controller.
-const FC_UART_BAUD: u32 = 921_600;
-/// GNSS UART baud rate (TX only); must match the receiver's RTCM input port.
-const GNSS_UART_BAUD: u32 = 115_200;
 
 // ---------------------------------------------------------------------------
 // COBS framing constants (matches cybflight wire format)
@@ -133,7 +128,7 @@ const RTCM_PIPE_SIZE: usize = 8192;
 const WIFI_RX_QUEUE: usize = 12;
 const WIFI_TX_QUEUE: usize = 6;
 
-/// Period of the counters log line.
+/// Period of the counters log, once turned on from the shell (`stats on`).
 const STATS_PERIOD: Duration = Duration::from_secs(5);
 
 /// One decoded wire frame `[msg_id][seq][payload…]`.
@@ -164,7 +159,8 @@ static DL_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// `rtcm_enqueue`'s capacity check-then-write is race-free only because of it.
 static RTCM_PIPE: Pipe<CriticalSectionRawMutex, RTCM_PIPE_SIZE> = Pipe::new();
 
-/// Cumulative counters. Logged every `STATS_PERIOD`; four of them also ride
+/// Cumulative counters. Shown by the shell's `stats`, and logged every
+/// `STATS_PERIOD` after `stats on`; four of them also ride
 /// in every downlink batch header so the ground station sees them.
 struct BridgeStats {
     fc_rx_errors: AtomicU32,
@@ -511,12 +507,12 @@ async fn led_task(mut led: board::StatusLed) {
 // ---------------------------------------------------------------------------
 
 #[embassy_executor::task]
-async fn wifi_task(mut controller: WifiController<'static>) {
+async fn wifi_task(mut controller: WifiController<'static>, ssid: Ssid, password: Password) {
     loop {
         if !matches!(controller.is_started(), Ok(true)) {
             let client_config = ClientConfig::default()
-                .with_ssid(WIFI_SSID.to_string())
-                .with_password(WIFI_PASSWORD.to_string());
+                .with_ssid(ssid.as_str().to_string())
+                .with_password(password.as_str().to_string());
             let config = ModeConfig::Client(client_config);
             controller.set_config(&config).unwrap();
             set_status(LinkStatus::WifiConnecting);
@@ -524,7 +520,7 @@ async fn wifi_task(mut controller: WifiController<'static>) {
             controller.start_async().await.unwrap();
         }
 
-        info!("WiFi: connecting to \"{}\"...", WIFI_SSID);
+        info!("WiFi: connecting to \"{}\"...", ssid);
         match controller.connect_async().await {
             Ok(()) => {
                 info!("WiFi: connected");
@@ -571,6 +567,8 @@ async fn sntp_task(stack: Stack<'static>) {
     stack.wait_config_up().await;
     info!("SNTP: network ready, starting sync");
 
+    let mut synced = false;
+    let mut warned = false;
     loop {
         // The NTP server is the ground station; nothing to ask until it has
         // been heard from.
@@ -578,15 +576,23 @@ async fn sntp_task(stack: Stack<'static>) {
             Timer::after_secs(1).await;
             continue;
         };
+        // Log only changes (first sync, lost, back), not every 3 s query:
+        // the log shares the port with the settings shell.
         match sntp_query(stack, server).await {
             Some(ntp_us) => {
                 let now_us = embassy_time::Instant::now().as_micros() as i64;
                 set_ntp_sync(ntp_us, now_us);
-                info!("SNTP: synced (offset captured)");
+                if !synced {
+                    info!("SNTP: synced to {}", server);
+                    synced = true;
+                }
             }
-            None => {
-                warn!("SNTP: query failed");
+            None if synced || !warned => {
+                warn!("SNTP: no reply from {} (is an NTP server running there?)", server);
+                synced = false;
+                warned = true;
             }
+            None => {}
         }
         Timer::after_secs(3).await;
     }
@@ -954,14 +960,79 @@ async fn rtcm_uart_writer_task(mut tx: UartTx<'static, Async>) {
 }
 
 // ---------------------------------------------------------------------------
+// Settings shell (USB-Serial-JTAG)
+// ---------------------------------------------------------------------------
+
+#[embassy_executor::task]
+async fn shell_task(usb: USB_DEVICE<'static>, store: settings::Store) {
+    let hooks = shell::Hooks {
+        print_stats,
+        set_stats_log: |on| STATS_LOG.store(on, Ordering::Relaxed),
+    };
+    shell::run(usb, store, hooks).await
+}
+
+/// The shell's `stats`: link state and every counter, one subsystem per line.
+/// The peaks (high-water marks) restart from zero after each call.
+fn print_stats() {
+    use esp_println::print;
+    let g = |c: &AtomicU32| c.load(Ordering::Relaxed);
+    let wifi = match LinkStatus::from_u8(BRIDGE_STATUS.load(Ordering::Relaxed)) {
+        LinkStatus::Booting => "booting",
+        LinkStatus::WifiConnecting => "connecting",
+        LinkStatus::WifiConnected => "connected",
+        LinkStatus::WifiDisconnected => "disconnected",
+    };
+    match ground_station() {
+        Some(ip) => print!("wifi     {wifi}; ground station {ip}\r\n"),
+        None => print!("wifi     {wifi}; no ground station heard yet\r\n"),
+    }
+    print!(
+        "stm32    rx {}B, uart errors {}, bad frames {}\r\n",
+        g(&STATS.fc_rx_bytes),
+        g(&STATS.fc_rx_errors),
+        g(&STATS.dl_cobs_errors),
+    );
+    print!(
+        "downlink frames {}, datagrams {}, queue drops {} (peak {}), send errors {}\r\n",
+        g(&STATS.dl_frames_sent),
+        g(&STATS.dl_datagrams),
+        g(&STATS.dl_queue_drops),
+        STATS.dl_queue_hwm.swap(0, Ordering::Relaxed),
+        g(&STATS.dl_send_errors),
+    );
+    print!(
+        "rtcm     rx {} ({}B), drops {}, errors {}, buffer peak {}B, to receiver {}B\r\n",
+        g(&STATS.rtcm_rx_dgrams),
+        g(&STATS.rtcm_rx_bytes),
+        g(&STATS.rtcm_drops),
+        g(&STATS.rtcm_recv_errors),
+        STATS.rtcm_pipe_hwm.swap(0, Ordering::Relaxed),
+        g(&STATS.rtcm_uart_bytes),
+    );
+    print!(
+        "uplink   dropped from other ground stations {}\r\n",
+        g(&STATS.uplink_foreign_drops),
+    );
+    print!("heap     {}B free\r\n", esp_alloc::HEAP.free());
+}
+
+// ---------------------------------------------------------------------------
 // Counters log
 // ---------------------------------------------------------------------------
+
+/// Whether `stats_task` logs the counters; toggled from the shell
+/// (`stats on|off`). Off at boot, so the console stays quiet while you type.
+static STATS_LOG: AtomicBool = AtomicBool::new(false);
 
 #[embassy_executor::task]
 async fn stats_task() {
     let mut ticker = Ticker::every(STATS_PERIOD);
     loop {
         ticker.next().await;
+        if !STATS_LOG.load(Ordering::Relaxed) {
+            continue;
+        }
         let g = |c: &AtomicU32| c.load(Ordering::Relaxed);
         info!(
             "stats: fc err {} rx {}B | dl frames {} dgrams {} qdrop {} cobs {} send_err {} qhwm {} \
@@ -1000,30 +1071,41 @@ async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
 
     // 2. Init logging via USB serial.
-    esp_println::logger::init_logger_from_env();
+    // Lines end in CR LF for terminals such as minicom (see the module docs).
+    cybesp_bridge::logger::init();
 
     // 3. Heap allocator — WiFi requires dynamic allocation. Sized for the
     // enlarged WiFi RX queue (each held frame pins a buffer).
     esp_alloc::heap_allocator!(size: 96_000);
 
-    // 4. Board: claims its UARTs and pins, sets up the status LED and antenna
-    // (before WiFi init), and returns what the application needs. The UART
-    // halves stay Blocking until their tasks convert them on their own
-    // executors. The board picks the UARTs and pins; the settings are ours.
-    let board::Board { fc_rx, fc_tx, gnss_tx, led, wifi, timg0, sw_interrupt } = board::init(
-        peripherals,
-        board::LinkConfig {
-            fc_uart: uart::Config::default()
-                .with_baudrate(FC_UART_BAUD)
-                .with_rx(RxConfig::default().with_fifo_full_threshold(FC_RX_FIFO_THRESHOLD)),
-            gnss_uart: uart::Config::default().with_baudrate(GNSS_UART_BAUD),
-        },
-    );
-    info!("cybesp-bridge: board {}, STM32 link {} baud", board::NAME, FC_UART_BAUD);
-    match gnss_tx {
-        Some(_) => info!("cybesp-bridge: GNSS UART {} baud (RTCM3 → receiver)", GNSS_UART_BAUD),
-        None => warn!("cybesp-bridge: this board has no GNSS UART; RTCM corrections disabled"),
+    // 4. Settings and board. The settings live in flash, and the board needs
+    // some of them (baud rates, antenna) while it claims its UARTs and pins,
+    // so it hands the flash peripheral over first. The board then sets up the
+    // status LED and antenna (before WiFi init) and returns what the
+    // application needs. The UART halves stay Blocking until their tasks
+    // convert them on their own executors.
+    let mut store = None;
+    let board::Board { fc_rx, fc_tx, gnss_tx, led, wifi, timg0, sw_interrupt, usb } =
+        board::init(peripherals, |flash| {
+            let s = embassy_futures::block_on(settings::Store::open(flash));
+            let cfg = board::BoardConfig {
+                fc_uart: uart::Config::default()
+                    .with_baudrate(s.current.fc_baud)
+                    .with_rx(RxConfig::default().with_fifo_full_threshold(FC_RX_FIFO_THRESHOLD)),
+                gnss_uart: uart::Config::default().with_baudrate(s.current.gnss_baud),
+                ext_antenna: s.current.ext_antenna,
+            };
+            store = Some(s);
+            cfg
+        });
+    // `init` always calls the closure before returning.
+    let store = store.unwrap();
+    info!("cybesp-bridge: board {}", board::NAME);
+    store.log_all();
+    if gnss_tx.is_none() {
+        warn!("cybesp-bridge: this board has no GNSS UART; RTCM corrections disabled");
     }
+    let settings::Settings { wifi_ssid, wifi_pass, .. } = store.current.clone();
 
     // 5. Start esp-rtos scheduler (must happen before esp_radio::init).
     let timg0 = esp_hal::timer::timg::TimerGroup::new(timg0);
@@ -1082,7 +1164,7 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     // 10. Spawn tasks.
-    spawner.spawn(wifi_task(controller)).unwrap();
+    spawner.spawn(wifi_task(controller, wifi_ssid, wifi_pass)).unwrap();
     spawner.spawn(net_task(runner)).unwrap();
     if has_gnss {
         spawner.spawn(rtcm_uplink_task(stack)).unwrap();
@@ -1091,6 +1173,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(uplink_task(fc_tx, stack)).unwrap();
     spawner.spawn(sntp_task(stack)).unwrap();
     spawner.spawn(stats_task()).unwrap();
+    spawner.spawn(shell_task(usb, store)).unwrap();
 
     info!("cybesp-bridge: all tasks spawned");
 

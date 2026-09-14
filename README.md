@@ -43,7 +43,7 @@ antenna handling differ. Each board's wiring lives in its own file under
 | UART0 RX | STM32 USART6 TX (PC6) | GPIO17 | GPIO17 (D7) |
 | UART1 TX | ublox UART2 (RTCM3 in) | GPIO14 | GPIO0 (D0) |
 | Status LED | onboard | WS2812 RGB on GPIO8 | mono LED on GPIO15 |
-| Antenna | onboard | fixed | GPIO3=LOW + GPIO14=LOW (built-in PCB); GPIO14=HIGH (external u.FL) with `ext-antenna` |
+| Antenna | onboard | fixed | GPIO3=LOW + GPIO14=LOW (built-in PCB); GPIO14=HIGH (external u.FL) with the `ext_antenna` setting |
 | GND | STM32 GND | GND | GND |
 
 UART0 configuration: 921600 baud, 8N1, no flow control. UART1: 115200 baud,
@@ -70,13 +70,10 @@ GPIO0.
 
 ## Configuration
 
-Two settings are fixed at build time, so rebuild and reflash after changing
-either:
-
 | Setting | Where to set it |
 |---------|-----------------|
-| ESP32 board (and antenna) | Cargo feature on the build command — see [Board](#board) |
-| WiFi network name and password | `WIFI_SSID`, `WIFI_PASSWORD` in `src/bin/main.rs` |
+| ESP32 board | Cargo feature on the build command — see [Board](#board) |
+| WiFi name and password, link baud rates, XIAO antenna | the board's USB settings shell — see [Settings](#settings) |
 
 The ground station's IP is **not** configured anywhere: the bridge learns it
 while running. See [Ground station](#ground-station).
@@ -86,31 +83,57 @@ while running. See [Ground station](#ground-station).
 Choose exactly one board feature when building (commands in
 [Building & Flashing](#building--flashing)):
 
-| Board | Features |
-|-------|----------|
+| Board | Feature |
+|-------|---------|
 | Waveshare ESP32-C6-Zero | `board-waveshare` (the default) |
-| Seeed XIAO ESP32-C6, built-in antenna | `board-xiao-c6` |
-| Seeed XIAO ESP32-C6, external u.FL antenna fitted | `board-xiao-c6,ext-antenna` |
+| Seeed XIAO ESP32-C6 | `board-xiao-c6` |
 
-A build with no board or with two boards fails with an error saying so. Only
-use `ext-antenna` when an antenna is actually plugged in; see
-[docs/board_info.md](docs/board_info.md#xiao-antenna-selection). The boot log
-prints which board the firmware was built for.
+A build with no board or with two boards fails with an error saying so. The
+boot log prints which board the firmware was built for.
 
-### WiFi
+### Settings
 
-Edit the constants near the top of `src/bin/main.rs`:
+WiFi, the baud rates and the XIAO antenna are stored on the board and changed
+over its USB port, like the flight controller's `param` commands. Open the
+port in a terminal, for example `minicom -D /dev/ttyACM0` with hardware flow
+control off, and type `help`:
 
-```rust
-const WIFI_SSID: &str = "YOUR_SSID";
-const WIFI_PASSWORD: &str = "YOUR_PASSWORD";
+```
+param list                     show every setting
+param set wifi_ssid MyNetwork  the value is the rest of the line
+param set wifi_pass MyPassword
+param save                     write changes to flash
+reboot                         restart with the saved settings
+stats                          show WiFi, the ground station and the counters
+stats on | stats off           log the counters every 5 s (off at boot)
 ```
 
-The bridge joins this network and gets its own IP by DHCP. `cybgcs`
-identifies each drone by its bridge's IP, so reserve a fixed address for every
-bridge in the router and list those addresses in the `cybgcs` fleet config.
-These values are compiled in and committed with the source, so everyone with
-access to this repo can see the WiFi password.
+| Setting | Default | Notes |
+|---------|---------|-------|
+| `wifi_ssid` | `UTADR` | 1–32 characters |
+| `wifi_pass` | UTADR's password | 8–64 characters, or empty for an open network; shown only as its length |
+| `fc_baud` | `921600` | must match the STM32 flight controller |
+| `gnss_baud` | `115200` | must match the GNSS receiver's RTCM input |
+| `ext_antenna` | `0` | XIAO only: `1` selects the external u.FL antenna, only with one fitted (see [docs/board_info.md](docs/board_info.md#xiao-antenna-selection)) |
+
+- Changes apply after `param save` and `reboot`. The boot log lists the
+  settings in use.
+- `espflash flash` writes only the bootloader, partition table and app, so
+  saved settings should survive a reflash. `espflash erase-flash` clears
+  them, and `param reset <name>|all` followed by `param save` returns them to
+  the defaults.
+- `param save` pauses the bridge briefly while flash is written (telemetry and
+  RTK corrections stall for a moment), so change settings on the ground.
+- Log lines keep printing on the same port and can interleave with what you
+  type; the shell still reads the whole line. In minicom, turn on line wrap
+  (Ctrl-A W) so long log lines aren't cut off at the right edge.
+- A board with no saved settings uses the defaults above, which are compiled
+  in (`src/settings.rs`), so everyone with repo access can see the default
+  WiFi password.
+
+The bridge gets its own IP by DHCP. `cybgcs` identifies each drone by its
+bridge's IP, so reserve a fixed address for every bridge in the router and
+list those addresses in the `cybgcs` fleet config.
 
 ### Ground station
 
@@ -166,11 +189,7 @@ cargo run --release                 # build + flash + monitor
 
 # --- Seeed XIAO ESP32-C6 ---
 cargo build --release --no-default-features --features board-xiao-c6
-cargo run   --release --no-default-features --features board-xiao-c6
-
-# --- Seeed XIAO ESP32-C6 with an external u.FL antenna fitted ---
-cargo run   --release --no-default-features --features board-xiao-c6,ext-antenna
-```
+cargo run   --release --no-default-features --features board-xiao-c6```
 
 Log output appears in the monitor via USB serial. Set verbosity via the
 `ESP_LOG` environment variable (default: `info`).

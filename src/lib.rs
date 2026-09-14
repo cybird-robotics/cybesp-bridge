@@ -1,6 +1,9 @@
 #![no_std]
 
 pub mod board;
+pub mod logger;
+pub mod settings;
+pub mod shell;
 
 #[macro_export]
 macro_rules! mk_static {
