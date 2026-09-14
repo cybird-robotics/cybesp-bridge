@@ -42,6 +42,7 @@ learns the ground station's IP from the ground station's own traffic; see
 | **RTCM uplink** (RTK) — **highest priority** | UDP → pipe → UART1 TX (verbatim) | none (receiver parses RTCM3) | bind :4212 |
 | **Time sync (SNTP)** | UDP NTP query → GS NTP server | NTP wire format | → GS :123 |
 | **Time sync (PTP follow-up)** | UART0 TX every 3 s | COBS, msg_id 129 | — |
+| **Datalink status** (bridge-originated) | UART0 TX at 5 Hz, from boot | COBS, msg_id 134 (`WireDatalinkStatus`: kind, WiFi state, AP RSSI, reconnects, uptime) | — |
 
 Key constants live at the top of `src/bin/main.rs`: `DOWNLINK_PORT` (4210),
 `UPLINK_PORT` (4211), `RTCM_UPLINK_PORT` (4212). WiFi credentials, the baud
@@ -122,8 +123,8 @@ small bootstrap task that converts it with `into_async()` in place.
 | `fc_rx_drain_task` | SWI2 | STM32 link RX → `FrameAccumulator` → whole decoded frames into `DL_QUEUE` (drops the oldest when full); marks each burst's end on RX idle. |
 | `rtcm_uplink_task` | thread | UDP :4212 → whole datagram into `RTCM_PIPE`, or drop and count. Does nothing else, so the socket drains even while UART1 shifts out a 1 KB frame (~89 ms). |
 | `downlink_task` | thread | `DL_QUEUE` → one batch datagram per UART burst → GS :4210. |
-| `uplink_task` | thread | UDP :4211 → COBS encode → UART0 TX. Also emits PTP time-sync frames every 3 s. |
-| `wifi_task` | thread | STA connect + auto-reconnect; drives `BRIDGE_STATUS`. |
+| `uplink_task` | thread | UDP :4211 → COBS encode → UART0 TX. Also emits PTP time-sync frames every 3 s, and the 5 Hz datalink status from boot (before the network is up — a bridge that never associates must still show in the FC's log). |
+| `wifi_task` | thread | STA connect + auto-reconnect; drives `BRIDGE_STATUS`. While connected, polls `is_connected()` + the AP RSSI every 200 ms into `LINK_RSSI`; counts disconnects in `WIFI_RECONNECTS`. |
 | `net_task` | thread | Runs the `embassy-net` stack. |
 | `sntp_task` | thread | Polls the GS NTP server every 3 s; stores sync point in `NTP_STATE`. |
 | `stats_task` | thread | Logs the `STATS` counters every 5 s, only after `stats on` in the shell (off at boot). |
@@ -146,7 +147,12 @@ frames carry no CRC, and a spliced frame could decode as valid.
 ### Shared state
 
 - `BRIDGE_STATUS: AtomicU8` — `BOOTING / WIFI_CONNECTING / WIFI_CONNECTED /
-  WIFI_DISCONNECTED`. Set by `wifi_task`, read by `led_task`.
+  WIFI_DISCONNECTED`. Set by `wifi_task`, read by `led_task` and sent to the
+  FC as `WireDatalinkStatus::state` (values pinned by a const assert).
+- `LINK_RSSI: AtomicI8` / `WIFI_RECONNECTS: AtomicU32` — AP RSSI [dBm]
+  (`RSSI_UNKNOWN` when not associated) and disconnect count. Written by
+  `wifi_task`, read by `uplink_task` for the datalink status frame and by
+  the shell's `stats`.
 - `NTP_STATE: Mutex<RefCell<Option<(i64, i64)>>>` — `(ntp_us, capture_instant_us)`.
   Written by `sntp_task`, read by `uplink_task` via `get_ntp_time_us()` which
   extrapolates from the monotonic clock between SNTP queries.

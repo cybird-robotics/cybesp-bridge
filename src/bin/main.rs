@@ -26,12 +26,15 @@ extern crate esp_backtrace as _;
 
 use alloc::string::ToString;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, AtomicU32, Ordering};
 use critical_section::Mutex;
 use cybflight_msgs::udp_batch::{self, BatchHeader, BatchWriter};
-use cybflight_msgs::wire::FRAME_HEADER_SIZE;
+use cybflight_msgs::wire::{
+    datalink_kind, datalink_state, msg_id, WireDatalinkStatus, WireMessage, FRAME_HEADER_SIZE,
+    RSSI_UNKNOWN,
+};
 use embassy_executor::Spawner;
-use embassy_futures::select::{self, Either};
+use embassy_futures::select::{self, Either, Either3};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpAddress, IpEndpoint, Ipv4Address, Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -42,7 +45,7 @@ use esp_hal::interrupt::Priority;
 use esp_hal::uart::{self, RxConfig, UartRx, UartTx};
 use esp_hal::{Async, Blocking};
 use esp_radio::wifi::{
-    ClientConfig, ModeConfig, PowerSaveMode, WifiController, WifiDevice, WifiEvent,
+    ClientConfig, ModeConfig, PowerSaveMode, WifiController, WifiDevice,
 };
 use esp_rtos::embassy::InterruptExecutor;
 use log::{info, warn};
@@ -335,6 +338,26 @@ fn set_status(status: LinkStatus) {
     BRIDGE_STATUS.store(status as u8, Ordering::Relaxed);
 }
 
+// `BRIDGE_STATUS` goes to the FC verbatim as `WireDatalinkStatus::state`.
+const _: () = {
+    assert!(LinkStatus::Booting as u8 == datalink_state::BOOTING);
+    assert!(LinkStatus::WifiConnecting as u8 == datalink_state::CONNECTING);
+    assert!(LinkStatus::WifiConnected as u8 == datalink_state::CONNECTED);
+    assert!(LinkStatus::WifiDisconnected as u8 == datalink_state::DISCONNECTED);
+};
+
+/// RSSI of the associated access point from its last beacon [dBm], polled by
+/// `wifi_task` every [`DATALINK_STATUS_PERIOD`] while connected;
+/// `RSSI_UNKNOWN` otherwise. Reported to the FC in `WireDatalinkStatus`.
+static LINK_RSSI: AtomicI8 = AtomicI8::new(RSSI_UNKNOWN);
+
+/// WiFi disconnects since boot — reported so the FC's log shows a link
+/// drop even when the bridge reconnects between two status frames.
+static WIFI_RECONNECTS: AtomicU32 = AtomicU32::new(0);
+
+/// Period of the RSSI poll and of the `WireDatalinkStatus` frame (5 Hz).
+const DATALINK_STATUS_PERIOD: Duration = Duration::from_millis(200);
+
 // ---------------------------------------------------------------------------
 // NTP time state — shared between SNTP task and uplink task
 // ---------------------------------------------------------------------------
@@ -534,8 +557,20 @@ async fn wifi_task(mut controller: WifiController<'static>, ssid: Ssid, password
             }
         }
 
-        // Stay here while connected; when we drop out, loop reconnects.
-        controller.wait_for_event(WifiEvent::StaDisconnected).await;
+        // Stay here while connected, sampling the AP's RSSI for the FC's
+        // datalink status; when we drop out, loop reconnects. Polls
+        // `is_connected()` instead of `wait_for_event(StaDisconnected)`:
+        // that wait holds `&mut controller` (no `rssi()` meanwhile), and
+        // re-creating it per tick clears pending events, which could lose a
+        // disconnect landing between two ticks. The STA state only moves on
+        // start/stop/connect/disconnect events, so this exits on a real drop.
+        while matches!(controller.is_connected(), Ok(true)) {
+            let rssi = controller.rssi().map_or(RSSI_UNKNOWN, |r| r.clamp(-127, 0) as i8);
+            LINK_RSSI.store(rssi, Ordering::Relaxed);
+            Timer::after(DATALINK_STATUS_PERIOD).await;
+        }
+        LINK_RSSI.store(RSSI_UNKNOWN, Ordering::Relaxed);
+        WIFI_RECONNECTS.fetch_add(1, Ordering::Relaxed);
         warn!("WiFi: disconnected, will reconnect...");
         set_status(LinkStatus::WifiDisconnected);
         Timer::after_millis(1000).await;
@@ -785,17 +820,61 @@ fn build_time_sync_frame(
     frame
 }
 
-#[embassy_executor::task]
-async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<'static>) {
-    // Wait for network to be ready.
-    loop {
-        if stack.is_link_up() {
-            break;
-        }
+/// Raw `WireDatalinkStatus` frame from the shared link state.
+fn build_datalink_status_frame(
+    seq: &mut u8,
+) -> [u8; FRAME_HEADER_SIZE + core::mem::size_of::<WireDatalinkStatus>()] {
+    let status = WireDatalinkStatus {
+        kind: datalink_kind::WIFI,
+        state: BRIDGE_STATUS.load(Ordering::Relaxed),
+        rssi_dbm: LINK_RSSI.load(Ordering::Relaxed),
+        reconnects: WIFI_RECONNECTS.load(Ordering::Relaxed).min(u32::from(u16::MAX)) as u16,
+        bridge_uptime_ms: Instant::now().as_millis() as u32,
+    };
+    let mut frame = [0u8; FRAME_HEADER_SIZE + core::mem::size_of::<WireDatalinkStatus>()];
+    frame[0] = msg_id::DATALINK_STATUS;
+    frame[1] = *seq;
+    *seq = seq.wrapping_add(1);
+    frame[FRAME_HEADER_SIZE..].copy_from_slice(status.as_bytes());
+    frame
+}
+
+/// COBS-frame `raw` and write it to the FC on UART0.
+async fn write_fc_frame(
+    uart_tx: &mut UartTx<'static, esp_hal::Async>,
+    cobs_buf: &mut [u8],
+    raw: &[u8],
+    what: &str,
+) {
+    let encoded_len = cobs::encode(raw, cobs_buf);
+    cobs_buf[encoded_len] = 0x00;
+    if let Err(e) = embedded_io_async::Write::write_all(uart_tx, &cobs_buf[..=encoded_len]).await {
+        warn!("Uplink: {} UART write error: {:?}", what, e);
+    }
+}
+
+/// Wait for WiFi association and a DHCP address.
+async fn wait_network(stack: Stack<'static>) {
+    while !stack.is_link_up() {
         Timer::after_millis(100).await;
     }
-    info!("Uplink: network link up, waiting for IP...");
     stack.wait_config_up().await;
+}
+
+#[embassy_executor::task]
+async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<'static>) {
+    let mut cobs_buf = [0u8; MAX_COBS_BUF];
+    let mut seq: u8 = 0;
+    let mut status_ticker = Ticker::every(DATALINK_STATUS_PERIOD);
+
+    // Wait for the network, reporting link status to the FC meanwhile — a
+    // bridge that never associates is exactly what the FC's log must show.
+    while let Either::Second(()) =
+        select::select(wait_network(stack), status_ticker.next()).await
+    {
+        let frame = build_datalink_status_frame(&mut seq);
+        write_fc_frame(&mut uart_tx, &mut cobs_buf, &frame, "datalink status").await;
+    }
     info!("Uplink: IP acquired, starting");
 
     // Uplink carries FLEET_STATE (~128 B @ 10 Hz), GNSS_ORIGIN_SET (1 Hz) and
@@ -810,21 +889,20 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
     info!("Uplink: listening on UDP :{}", UPLINK_PORT);
 
     let mut recv_buf = [0u8; MAX_RAW_FRAME];
-    let mut cobs_buf = [0u8; MAX_COBS_BUF];
-    let mut seq: u8 = 0;
 
     // PTP follow-up state: NTP time at TX-complete of the previous time sync frame.
     let mut prev_tx_complete_ntp_us: i64 = 0;
     let mut time_sync_ticker = Ticker::every(embassy_time::Duration::from_secs(3));
 
     loop {
-        match select::select(
+        match select::select3(
             socket.recv_from(&mut recv_buf),
             time_sync_ticker.next(),
+            status_ticker.next(),
         )
         .await
         {
-            Either::First(Ok((n, meta))) => {
+            Either3::First(Ok((n, meta))) => {
                 if !accept_uplink(meta.endpoint) {
                     send_busy_notice(&socket, meta.endpoint).await;
                     continue;
@@ -840,11 +918,11 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
                     warn!("Uplink: UART write error: {:?}", e);
                 }
             }
-            Either::First(Err(e)) => {
+            Either3::First(Err(e)) => {
                 // Only `Truncated` (datagram larger than a frame); no sleep.
                 warn!("Uplink: UDP recv error: {:?}", e);
             }
-            Either::Second(_) => {
+            Either3::Second(_) => {
                 // Time sync tick: send PTP follow-up frame to STM32.
                 if let Some(send_ntp_us) = get_ntp_time_us() {
                     let frame =
@@ -867,6 +945,10 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
                     // absorbed by the STM32's EMA smoother.
                     prev_tx_complete_ntp_us = get_ntp_time_us().unwrap_or(0);
                 }
+            }
+            Either3::Third(()) => {
+                let frame = build_datalink_status_frame(&mut seq);
+                write_fc_frame(&mut uart_tx, &mut cobs_buf, &frame, "datalink status").await;
             }
         }
     }
@@ -986,6 +1068,10 @@ fn print_stats() {
     match ground_station() {
         Some(ip) => print!("wifi     {wifi}; ground station {ip}\r\n"),
         None => print!("wifi     {wifi}; no ground station heard yet\r\n"),
+    }
+    match LINK_RSSI.load(Ordering::Relaxed) {
+        RSSI_UNKNOWN => print!("radio    rssi --, reconnects {}\r\n", g(&WIFI_RECONNECTS)),
+        r => print!("radio    rssi {r} dBm, reconnects {}\r\n", g(&WIFI_RECONNECTS)),
     }
     print!(
         "stm32    rx {}B, uart errors {}, bad frames {}\r\n",
