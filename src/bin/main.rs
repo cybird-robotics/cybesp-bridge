@@ -1046,8 +1046,9 @@ async fn rtcm_uart_writer_task(mut tx: UartTx<'static, Async>) {
 // ---------------------------------------------------------------------------
 
 #[embassy_executor::task]
-async fn shell_task(usb: USB_DEVICE<'static>, store: settings::Store) {
+async fn shell_task(usb: USB_DEVICE<'static>, store: settings::Store, stack: Stack<'static>) {
     let hooks = shell::Hooks {
+        net: stack,
         print_stats,
         set_stats_log: |on| STATS_LOG.store(on, Ordering::Relaxed),
     };
@@ -1259,7 +1260,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(uplink_task(fc_tx, stack)).unwrap();
     spawner.spawn(sntp_task(stack)).unwrap();
     spawner.spawn(stats_task()).unwrap();
-    spawner.spawn(shell_task(usb, store)).unwrap();
+    spawner.spawn(shell_task(usb, store, stack)).unwrap();
 
     info!("cybesp-bridge: all tasks spawned");
 

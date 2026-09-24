@@ -9,6 +9,7 @@
 //! esp-println writes the port's transmit FIFO directly, so a second writer
 //! (the driver's transmit half) would interleave with it byte by byte.
 
+use embassy_net::Stack;
 use esp_hal::peripherals::USB_DEVICE;
 use esp_hal::usb_serial_jtag::UsbSerialJtag;
 use esp_println::print;
@@ -32,6 +33,8 @@ const LINE_MAX: usize = 128;
 
 /// What the shell needs from the application besides the settings.
 pub struct Hooks {
+    /// The WiFi network stack, for its address (`ip`).
+    pub net: Stack<'static>,
     /// Print the bridge's link and counters (`stats`).
     pub print_stats: fn(),
     /// Turn the periodic counters log on or off (`stats on|off`).
@@ -83,6 +86,7 @@ async fn execute(line: &str, store: &mut Store, hooks: &Hooks) {
         "" => {}
         "help" => help(),
         "param" => param(args, store).await,
+        "ip" => ip(hooks.net),
         "stats" => match args {
             "" => (hooks.print_stats)(),
             "on" => {
@@ -157,6 +161,30 @@ async fn param(args: &str, store: &mut Store) {
     }
 }
 
+/// The bridge's address on the WiFi network (`ip`), as DHCP assigned it.
+fn ip(net: Stack<'static>) {
+    outln!("mac      {}", net.hardware_address());
+    if !net.is_link_up() {
+        outln!("ip       none (WiFi not connected)");
+        return;
+    }
+    let Some(cfg) = net.config_v4() else {
+        outln!("ip       none (connected, waiting for DHCP)");
+        return;
+    };
+    outln!("ip       {}", cfg.address);
+    match cfg.gateway {
+        Some(gw) => outln!("gateway  {gw}"),
+        None => outln!("gateway  none"),
+    }
+    if cfg.dns_servers.is_empty() {
+        outln!("dns      none");
+    }
+    for dns in &cfg.dns_servers {
+        outln!("dns      {dns}");
+    }
+}
+
 fn list(store: &Store) {
     for p in &PARAMS {
         show(store, p);
@@ -186,6 +214,7 @@ fn help() {
     outln!("  param save                 write changes to flash");
     outln!("  param reset <name>|all     back to the built-in default (then save)");
     outln!("  reboot                     restart and apply the saved settings");
+    outln!("  ip                         show the bridge's address on the WiFi network");
     outln!(
         "  stats                      show the link and counters (peaks since the last `stats`)"
     );

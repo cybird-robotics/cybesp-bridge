@@ -104,6 +104,7 @@ param set wifi_ssid MyNetwork  the value is the rest of the line
 param set wifi_pass MyPassword
 param save                     write changes to flash
 reboot                         restart with the saved settings
+ip                             show the bridge's IP address on the WiFi network
 stats                          show WiFi, the ground station and the counters
 stats on | stats off           log the counters every 5 s (off at boot)
 ```
@@ -189,7 +190,8 @@ cargo run --release                 # build + flash + monitor
 
 # --- Seeed XIAO ESP32-C6 ---
 cargo build --release --no-default-features --features board-xiao-c6
-cargo run   --release --no-default-features --features board-xiao-c6```
+cargo run   --release --no-default-features --features board-xiao-c6
+```
 
 Log output appears in the monitor via USB serial. Set verbosity via the
 `ESP_LOG` environment variable (default: `info`).

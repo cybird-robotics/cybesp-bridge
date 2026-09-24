@@ -128,7 +128,7 @@ small bootstrap task that converts it with `into_async()` in place.
 | `net_task` | thread | Runs the `embassy-net` stack. |
 | `sntp_task` | thread | Polls the GS NTP server every 3 s; stores sync point in `NTP_STATE`. |
 | `stats_task` | thread | Logs the `STATS` counters every 5 s, only after `stats on` in the shell (off at boot). |
-| `shell_task` | thread | USB settings shell (`param …`, `reboot`); see [Settings and USB shell](#settings-and-usb-shell). |
+| `shell_task` | thread | USB settings shell (`param …`, `reboot`, `ip`, `stats`); see [Settings and USB shell](#settings-and-usb-shell). |
 | `led_task` | thread | Passes `BRIDGE_STATUS` to the board's `StatusLed` every 50 ms; the board picks the pattern. |
 
 ### Buffering and loss policy
@@ -217,7 +217,8 @@ pins, so `board::init` hands the flash peripheral to the application first.
 receive half only) and prints through `esp_println`, like the logs. The
 driver's transmit half is never used: it would interleave with esp-println's
 direct FIFO writes. Commands: `param list | get | set | save | reset`,
-`reboot`. Settings apply at the next boot.
+`reboot`, `ip` (the DHCP address, gateway and DNS from the embassy-net stack),
+`stats`. Settings apply at the next boot.
 
 Every flash write or erase runs with interrupts masked on this single-core
 chip, so `param save` stalls the UART drains, the RTCM writer and WiFi while
