@@ -11,7 +11,7 @@ controller firmware, the bridge does not need reflashing.
 ## Data Flow
 
 ```
-Ground Station (Python)               ESP32-C6                    STM32H743
+Ground Station (cybgcs)               ESP32-C6                    STM32H743
 ───────────────────────               ────────                    ─────────
                                       WiFi STA
 UDP RX :4210  ◄──── UDP datagram ◄─── COBS decode ◄── UART RX ◄── COBS TX
@@ -31,7 +31,7 @@ UDP TX :4211  ────► UDP datagram ───► COBS encode ──► UA
 
 ## Hardware
 
-Two boards are supported, selected at build time via a Cargo feature
+Both boards are supported, selected at build time via a Cargo feature
 (`board-waveshare`, the default, or `board-xiao-c6`). Both use the ESP32-C6
 MCU and native USB for programming/logging. Only the RTCM pin, status LED, and
 antenna handling differ. Each board's wiring lives in its own file under
@@ -39,9 +39,9 @@ antenna handling differ. Each board's wiring lives in its own file under
 
 | Function | Connects to | Waveshare ESP32-C6-Zero | Seeed XIAO ESP32-C6 |
 |----------|-------------|-------------------------|---------------------|
-| UART0 TX | STM32 USART6 RX (PC7) | GPIO16 | GPIO16 (D6) |
-| UART0 RX | STM32 USART6 TX (PC6) | GPIO17 | GPIO17 (D7) |
-| UART1 TX | ublox UART2 (RTCM3 in) | GPIO14 | GPIO0 (D0) |
+| UART0 TX | SAKURA USART1 RX (PA10) | GPIO16 | GPIO16 (D6) |
+| UART0 RX | SAKURA USART1 TX (PA9) | GPIO17 | GPIO17 (D7) |
+| UART1 TX | UM982 correction input | GPIO14 | GPIO0 (D0) |
 | Status LED | onboard | WS2812 RGB on GPIO8 | mono LED on GPIO15 |
 | Antenna | onboard | fixed | GPIO3=LOW + GPIO14=LOW (built-in PCB); GPIO14=HIGH (external u.FL) with the `ext_antenna` setting |
 | GND | STM32 GND | GND | GND |
@@ -111,8 +111,8 @@ stats on | stats off           log the counters every 5 s (off at boot)
 
 | Setting | Default | Notes |
 |---------|---------|-------|
-| `wifi_ssid` | `UTADR` | 1–32 characters |
-| `wifi_pass` | UTADR's password | 8–64 characters, or empty for an open network; shown only as its length |
+| `wifi_ssid` | empty (configure before use) | 1–32 characters |
+| `wifi_pass` | empty | 8–64 characters, or empty for an open network; shown only as its length |
 | `fc_baud` | `921600` | must match the STM32 flight controller |
 | `gnss_baud` | `115200` | must match the GNSS receiver's RTCM input |
 | `ext_antenna` | `0` | XIAO only: `1` selects the external u.FL antenna, only with one fitted (see [docs/board_info.md](docs/board_info.md#xiao-antenna-selection)) |
@@ -128,9 +128,7 @@ stats on | stats off           log the counters every 5 s (off at boot)
 - Log lines keep printing on the same port and can interleave with what you
   type; the shell still reads the whole line. In minicom, turn on line wrap
   (Ctrl-A W) so long log lines aren't cut off at the right edge.
-- A board with no saved settings uses the defaults above, which are compiled
-  in (`src/settings.rs`), so everyone with repo access can see the default
-  WiFi password.
+- A board with no saved WiFi settings keeps the USB shell available and waits for configuration.
 
 The bridge gets its own IP by DHCP. `cybgcs` identifies each drone by its
 bridge's IP, so reserve a fixed address for every bridge in the router and
@@ -233,3 +231,11 @@ frame per datagram for a ground station that predates the envelope.
 | 4211 | Ground → ESP32 | Uplink commands (e.g. Vicon pose) |
 | 4212 | Ground → ESP32 | RTCM3 corrections for the GNSS receiver |
 | 123 | ESP32 → Ground | NTP time sync (the ground station runs the NTP server) |
+
+## Protocol and license
+
+The reference build uses `cybflight-msgs = 0.2.0`. The `fc-link-status` extension requires a compatible flight-controller receiver and is disabled by default. See [RELEASING.md](RELEASING.md) for coordinated releases.
+
+Copyright 2026 The Cybird project contributors. See [NOTICE](NOTICE).
+
+Licensed under [Apache-2.0](LICENSE).

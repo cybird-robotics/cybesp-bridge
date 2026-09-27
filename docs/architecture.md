@@ -253,8 +253,8 @@ A `compile_error!` guard enforces exactly one board feature.
 
 | Function | GPIO | Notes |
 |----------|------|-------|
-| UART0 TX → STM32 USART6 RX (PC7) | GPIO16 | 921600 8N1, COBS, bidirectional |
-| UART0 RX ← STM32 USART6 TX (PC6) | GPIO17 | |
+| UART0 TX → SAKURA USART1 RX (PA10) | GPIO16 | 921600 8N1, COBS, bidirectional |
+| UART0 RX ← SAKURA USART1 TX (PA9) | GPIO17 | |
 | UART1 TX → ublox UART2 (RTCM3) | GPIO14 | 115200, TX-only, unframed |
 | Status LED | GPIO8 | WS2812 **RGB** via RMT channel 0 |
 | Antenna | — | onboard, no GPIO control |

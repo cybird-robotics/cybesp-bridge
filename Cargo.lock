@@ -143,7 +143,9 @@ dependencies = [
 
 [[package]]
 name = "cybflight-msgs"
-version = "0.1.22"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4fa1dc1023f3c38b8b8585bc4127f8456c1662fd262bdff110c733f9b5706af"
 
 [[package]]
 name = "darling"

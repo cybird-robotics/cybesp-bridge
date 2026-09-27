@@ -29,10 +29,9 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, AtomicU32, Ordering};
 use critical_section::Mutex;
 use cybflight_msgs::udp_batch::{self, BatchHeader, BatchWriter};
-use cybflight_msgs::wire::{
-    datalink_kind, datalink_state, msg_id, WireDatalinkStatus, WireMessage, FRAME_HEADER_SIZE,
-    RSSI_UNKNOWN,
-};
+use cybflight_msgs::wire::{datalink_state, FRAME_HEADER_SIZE, RSSI_UNKNOWN};
+#[cfg(feature = "fc-link-status")]
+use cybflight_msgs::wire::{datalink_kind, msg_id, WireDatalinkStatus, WireMessage};
 use embassy_executor::Spawner;
 use embassy_futures::select::{self, Either, Either3};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -531,6 +530,12 @@ async fn led_task(mut led: board::StatusLed) {
 
 #[embassy_executor::task]
 async fn wifi_task(mut controller: WifiController<'static>, ssid: Ssid, password: Password) {
+    if ssid.is_empty() {
+        info!("WiFi is unconfigured. Set wifi_ssid and wifi_pass over USB, save, and restart.");
+        loop {
+            Timer::after_secs(60).await;
+        }
+    }
     loop {
         if !matches!(controller.is_started(), Ok(true)) {
             let client_config = ClientConfig::default()
@@ -821,6 +826,7 @@ fn build_time_sync_frame(
 }
 
 /// Raw `WireDatalinkStatus` frame from the shared link state.
+#[cfg(feature = "fc-link-status")]
 fn build_datalink_status_frame(
     seq: &mut u8,
 ) -> [u8; FRAME_HEADER_SIZE + core::mem::size_of::<WireDatalinkStatus>()] {
@@ -840,6 +846,7 @@ fn build_datalink_status_frame(
 }
 
 /// COBS-frame `raw` and write it to the FC on UART0.
+#[cfg(feature = "fc-link-status")]
 async fn write_fc_frame(
     uart_tx: &mut UartTx<'static, esp_hal::Async>,
     cobs_buf: &mut [u8],
@@ -872,8 +879,11 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
     while let Either::Second(()) =
         select::select(wait_network(stack), status_ticker.next()).await
     {
-        let frame = build_datalink_status_frame(&mut seq);
-        write_fc_frame(&mut uart_tx, &mut cobs_buf, &frame, "datalink status").await;
+        #[cfg(feature = "fc-link-status")]
+        {
+            let frame = build_datalink_status_frame(&mut seq);
+            write_fc_frame(&mut uart_tx, &mut cobs_buf, &frame, "datalink status").await;
+        }
     }
     info!("Uplink: IP acquired, starting");
 
@@ -947,8 +957,11 @@ async fn uplink_task(mut uart_tx: UartTx<'static, esp_hal::Async>, stack: Stack<
                 }
             }
             Either3::Third(()) => {
-                let frame = build_datalink_status_frame(&mut seq);
-                write_fc_frame(&mut uart_tx, &mut cobs_buf, &frame, "datalink status").await;
+                #[cfg(feature = "fc-link-status")]
+                {
+                    let frame = build_datalink_status_frame(&mut seq);
+                    write_fc_frame(&mut uart_tx, &mut cobs_buf, &frame, "datalink status").await;
+                }
             }
         }
     }

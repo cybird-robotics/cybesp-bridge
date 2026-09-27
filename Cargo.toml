@@ -2,8 +2,11 @@
 name = "cybesp-bridge"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
-publish = ["utadr"]
+rust-version = "1.94"
+publish = false
+license = "Apache-2.0"
+repository = "https://github.com/cybird-robotics/cybesp-bridge"
+description = "ESP32-C6 telemetry and RTK bridge for Cybflight"
 
 [[bin]]
 name = "cybesp-bridge"
@@ -18,6 +21,8 @@ board-waveshare = ["dep:esp-hal-smartled", "dep:smart-leds", "dep:rgb"]
 # Seeed XIAO ESP32-C6: monochrome LED on GPIO15, RTCM TX on GPIO0,
 # antenna switch on GPIO3/GPIO14.
 board-xiao-c6 = []
+# Requires flight-controller support for message 134.
+fc-link-status = []
 
 [dependencies]
 # ESP32-C6 HAL
@@ -60,7 +65,7 @@ sequential-storage = "8"
 heapless = "0.8"
 
 # Shared wire definitions (downlink batch envelope). `no_std`, no deps.
-cybflight-msgs = { path = "../cybflight-msgs", default-features = false }
+cybflight-msgs = { version = "=0.2.0", default-features = false }
 
 # Networking
 embassy-net = { version = "0.7.1", features = [

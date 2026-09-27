@@ -30,9 +30,9 @@ use sequential_storage::map::{MapConfig, MapStorage};
 use static_cell::StaticCell;
 
 /// WiFi network joined when no SSID is stored.
-const DEFAULT_WIFI_SSID: &str = "UTADR";
+const DEFAULT_WIFI_SSID: &str = "";
 /// Password for [`DEFAULT_WIFI_SSID`].
-const DEFAULT_WIFI_PASS: &str = "adr2025WIN";
+const DEFAULT_WIFI_PASS: &str = "";
 /// STM32 link baud (8N1, no flow control); must match the flight controller.
 const DEFAULT_FC_BAUD: u32 = 921_600;
 /// GNSS UART baud (TX only); must match the receiver's RTCM input port.
